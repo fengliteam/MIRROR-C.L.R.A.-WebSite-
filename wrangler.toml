@@ -1,5 +1,13 @@
 name = "clra-mirror"
-
-compatibility_date = "2026-07-03"
-
 main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "DOMAINS_KV"
+id = "112d018cb0a34661a05e0740469296b7"
+
+# 注意：ADMIN_API_KEY 是敏感信息，不应在此处硬编码！
+# 请使用 Cloudflare Dashboard 的 "变量与机密" 功能添加：
+# 变量名：ADMIN_API_KEY
+# 值：XingYing2026
+# 或者在部署时通过 wrangler secret put ADMIN_API_KEY 设置
