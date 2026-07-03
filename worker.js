@@ -1,5 +1,5 @@
 // ============================================================
-// CLRA Mirror - 强制全代理 + 泛域名支持 + 外链提示
+// CLRA Mirror - 强制全代理 + 泛域名支持 + 外链提示（修复版）
 // ============================================================
 
 const CONFIG = {
@@ -61,36 +61,76 @@ function isDomainAllowed(domain, allowedList) {
   });
 }
 
-// ---------- 核心：强制全代理，失败时返回特殊路径 ----------
+// ---------- 核心：强制全代理，绝不返回原始链接 ----------
 function rewriteUrl(originalUrl, domain) {
   if (!originalUrl || typeof originalUrl !== 'string') return originalUrl;
   if (/^(data|blob|javascript|mailto|tel|ws|wss):/i.test(originalUrl)) return originalUrl;
   if (originalUrl.startsWith('/proxy/')) return originalUrl;
 
+  // 处理相对协议
   let urlString = originalUrl;
   if (urlString.startsWith('//')) {
     urlString = 'https:' + urlString;
   }
 
+  // 尝试解析
+  let urlObj;
+  let targetDomain;
+  let path = '';
+  let search = '';
+  let hash = '';
+
   try {
-    let urlObj;
     if (urlString.startsWith('http://') || urlString.startsWith('https://')) {
       urlObj = new URL(urlString);
     } else {
+      // 相对路径，基于当前域构建
       urlObj = new URL(urlString, `https://${domain}/`);
     }
-    const targetDomain = urlObj.hostname;
-    // 如果目标域名包含 *，视为泛域名，我们也放行，代理层会处理
-    const path = urlObj.pathname;
-    const search = urlObj.search || '';
-    const hash = urlObj.hash || '';
-    const proxyPath = `/proxy/${encodeURIComponent(targetDomain)}${path}${search}${hash}`;
-    if (proxyPath.length > CONFIG.MAX_URL_LENGTH) return urlObj.href;
-    return proxyPath;
+    targetDomain = urlObj.hostname;
+    path = urlObj.pathname;
+    search = urlObj.search || '';
+    hash = urlObj.hash || '';
   } catch (_) {
-    // 解析失败，返回特殊标记，代理层会拦截
+    // 解析失败（如泛域名 *.example.com），我们直接从原始字符串提取域名和路径
+    // 尝试提取域名：从 http:// 或 https:// 后到第一个 / 或 ? 或 #
+    let temp = urlString;
+    if (temp.startsWith('http://')) temp = temp.slice(7);
+    else if (temp.startsWith('https://')) temp = temp.slice(8);
+    // 分割域名和路径
+    const slashIndex = temp.indexOf('/');
+    const qIndex = temp.indexOf('?');
+    const hashIndex = temp.indexOf('#');
+    let endIndex = temp.length;
+    if (slashIndex > 0) endIndex = Math.min(endIndex, slashIndex);
+    if (qIndex > 0) endIndex = Math.min(endIndex, qIndex);
+    if (hashIndex > 0) endIndex = Math.min(endIndex, hashIndex);
+    targetDomain = temp.slice(0, endIndex);
+    const rest = temp.slice(endIndex);
+    // 分离路径、查询、哈希
+    const queryMatch = rest.match(/^([^?#]*)(\?[^#]*)?(#.*)?$/);
+    if (queryMatch) {
+      path = queryMatch[1] || '/';
+      search = queryMatch[2] || '';
+      hash = queryMatch[3] || '';
+    } else {
+      path = '/';
+    }
+    if (!path.startsWith('/')) path = '/' + path;
+  }
+
+  // 如果域名仍然无效（空或只有*），返回一个特殊标记，由代理层处理
+  if (!targetDomain || targetDomain === '') {
     return '/proxy/blocked/';
   }
+
+  // 构建代理路径
+  const proxyPath = `/proxy/${encodeURIComponent(targetDomain)}${path}${search}${hash}`;
+  if (proxyPath.length > CONFIG.MAX_URL_LENGTH) {
+    // 过长则截断或返回特殊标记（但一般不会）
+    return '/proxy/blocked/';
+  }
+  return proxyPath;
 }
 
 // ---------- 获取域名列表 ----------
@@ -144,7 +184,7 @@ async function getDomainList(env) {
   return domainCache;
 }
 
-// ---------- 代理处理（含泛域名随机和外部链接提示） ----------
+// ---------- 代理处理（含泛域名随机和外链提示） ----------
 async function handleProxy(request, env) {
   const url = new URL(request.url);
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -154,7 +194,7 @@ async function handleProxy(request, env) {
 
   const pathMatch = url.pathname.match(/^\/proxy\/([^\/]+)(\/.*)?$/);
   if (!pathMatch) {
-    // 如果是特殊标记 /proxy/blocked/，返回错误页面
+    // 特殊标记
     if (url.pathname === '/proxy/blocked/') {
       return new Response('无效的链接，无法解析为目标域名', { status: 400 });
     }
@@ -165,14 +205,10 @@ async function handleProxy(request, env) {
   const targetPath = pathMatch[2] || '/';
   const targetSearch = url.search || '';
 
-  // 处理泛域名：如果域名包含 *，随机生成子域名
+  // 处理泛域名：如果域名包含 *，随机生成子域名并重定向
   if (domain.includes('*')) {
     const random = Math.random().toString(36).substring(2, 10);
-    // 将 * 替换为随机字符串，但需要处理 *.example.com 格式
     let newDomain = domain.replace(/\*/g, random);
-    // 如果域名是 *.example.com，替换后为 random.example.com
-    // 如果域名是 *.*.example.com，则替换所有 *
-    // 构造新 URL 并重定向
     const newProxyPath = `/proxy/${encodeURIComponent(newDomain)}${targetPath}${targetSearch}`;
     return new Response(null, {
       status: 302,
@@ -180,9 +216,10 @@ async function handleProxy(request, env) {
     });
   }
 
+  // 白名单检查
   const allowedDomains = await getDomainList(env);
   if (!isDomainAllowed(domain, allowedDomains)) {
-    // 返回中转提示页面，让用户选择是否直接访问原网站
+    // 返回中转提示页面
     const originalUrl = `https://${domain}${targetPath}${targetSearch}`;
     const html = `
       <!DOCTYPE html>
@@ -322,7 +359,7 @@ async function handleProxy(request, env) {
   }
 }
 
-// ---------- API 处理（同上，保持不变） ----------
+// ---------- API 处理（同前） ----------
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const method = request.method;
@@ -456,7 +493,7 @@ async function handleApi(request, env) {
   return new Response('API 路径不存在', { status: 404 });
 }
 
-// ---------- 构建 HTML（UI 不变） ----------
+// ---------- 构建 HTML（UI 保持不变） ----------
 function buildAppHtml(domains, friendLinks) {
   const domainItems = domains.map(d => {
     const isWildcard = d.startsWith('*.');
