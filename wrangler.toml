@@ -5,3 +5,7 @@ compatibility_date = "2024-01-01"
 [[kv_namespaces]]
 binding = "DOMAINS_KV"
 id = "112d018cb0a34661a05e0740469296b7"
+
+[vars]
+# 友链配置（JSON 数组格式）
+FRIEND_LINKS = '[{"name":"星影","url":"XingYing.us.kg"},{"name":"LZH","url":"lzh173.chat"}]'
