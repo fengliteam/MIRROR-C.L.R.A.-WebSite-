@@ -1,8 +1,6 @@
 // ============================================================
-// CLRA Mirror - 加强版 (Premium)
-// 特性：现代化UI、增强代理、批量管理、泛域名随机子域名
-// 安全：密码通过环境变量 ADMIN_API_KEY 注入
-// 友链：通过环境变量 FRIEND_LINKS (JSON数组) 配置
+// CLRA Mirror - 强制全代理版
+// 特性：所有链接强制走代理，白名单校验，现代化UI
 // ============================================================
 
 const CONFIG = {
@@ -12,16 +10,15 @@ const CONFIG = {
   ],
   HARDCODED_DOMAINS: ['jpt.lzh173.chat', 'scltk.lzh173.chat'],
   RATE_LIMIT_PER_MIN: 100,
-  DOMAIN_CACHE_TTL: 60,      // 秒
+  DOMAIN_CACHE_TTL: 60,
   MAX_URL_LENGTH: 15000,
 };
 
-// ---------- 全局状态 ----------
 let domainCache = null;
 let cacheTimestamp = 0;
 const rateMap = new Map();
 
-// ---------- 工具函数 ----------
+// ---------- 工具 ----------
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -53,7 +50,6 @@ function isRateLimited(ip) {
   return false;
 }
 
-// 域名匹配（支持通配符）
 function isDomainAllowed(domain, allowedList) {
   if (!Array.isArray(allowedList) || allowedList.length === 0) return false;
   return allowedList.some(pattern => {
@@ -66,13 +62,15 @@ function isDomainAllowed(domain, allowedList) {
   });
 }
 
-// 增强 URL 重写（支持相对协议、更多标签）
+// ---------- 核心修改：强制所有链接走代理 ----------
 function rewriteUrl(originalUrl, domain) {
   if (!originalUrl || typeof originalUrl !== 'string') return originalUrl;
+  // 保留特殊协议
   if (/^(data|blob|javascript|mailto|tel|ws|wss):/i.test(originalUrl)) return originalUrl;
+  // 已经是代理链接则直接返回
   if (originalUrl.startsWith('/proxy/')) return originalUrl;
 
-  // 处理相对协议 //example.com/path
+  // 处理相对协议 //example.com
   let urlString = originalUrl;
   if (urlString.startsWith('//')) {
     urlString = 'https:' + urlString;
@@ -82,15 +80,16 @@ function rewriteUrl(originalUrl, domain) {
     let urlObj;
     if (urlString.startsWith('http://') || urlString.startsWith('https://')) {
       urlObj = new URL(urlString);
-      // 只代理同域资源（可修改为代理所有，但安全性降低）
-      if (urlObj.hostname !== domain) return originalUrl;
     } else {
+      // 相对路径，基于当前代理的域名构建
       urlObj = new URL(urlString, `https://${domain}/`);
     }
+    // 提取目标域名（不区分是否同域）
+    const targetDomain = urlObj.hostname;
     const path = urlObj.pathname;
     const search = urlObj.search || '';
     const hash = urlObj.hash || '';
-    const proxyPath = `/proxy/${encodeURIComponent(domain)}${path}${search}${hash}`;
+    const proxyPath = `/proxy/${encodeURIComponent(targetDomain)}${path}${search}${hash}`;
     if (proxyPath.length > CONFIG.MAX_URL_LENGTH) return urlObj.href;
     return proxyPath;
   } catch (_) {
@@ -98,7 +97,7 @@ function rewriteUrl(originalUrl, domain) {
   }
 }
 
-// ---------- 获取域名列表 ----------
+// ---------- 获取域名列表（不变） ----------
 async function getDomainList(env) {
   const now = Date.now();
   if (domainCache && (now - cacheTimestamp) < CONFIG.DOMAIN_CACHE_TTL * 1000) {
@@ -130,7 +129,6 @@ async function getDomainList(env) {
     } catch (_) {}
   }
 
-  // 友链域名加入白名单
   if (env && env.FRIEND_LINKS) {
     try {
       const friends = JSON.parse(env.FRIEND_LINKS);
@@ -150,7 +148,7 @@ async function getDomainList(env) {
   return domainCache;
 }
 
-// ---------- 代理处理（增强版） ----------
+// ---------- 代理处理（不变，依然检查白名单） ----------
 async function handleProxy(request, env) {
   const url = new URL(request.url);
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -166,7 +164,7 @@ async function handleProxy(request, env) {
 
   const allowedDomains = await getDomainList(env);
   if (!isDomainAllowed(domain, allowedDomains)) {
-    return new Response('该域名不在允许列表中', { status: 403 });
+    return new Response('该域名不在允许列表中，拒绝代理', { status: 403 });
   }
 
   let targetUrl;
@@ -196,14 +194,11 @@ async function handleProxy(request, env) {
       redirect: 'manual',
     });
 
-    // 重定向处理
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('Location');
       if (location) {
         const newHeaders = new Headers(response.headers);
-        // 重写 Location
-        const rewrittenLocation = rewriteUrl(location, domain);
-        newHeaders.set('Location', rewrittenLocation);
+        newHeaders.set('Location', rewriteUrl(location, domain));
         return new Response(null, { status: response.status, headers: newHeaders });
       }
     }
@@ -213,7 +208,6 @@ async function handleProxy(request, env) {
     respHeaders.delete('content-security-policy');
     respHeaders.delete('content-security-policy-report-only');
 
-    // ---------- HTML 重写（加强） ----------
     if (contentType.includes('text/html')) {
       const rewriter = new HTMLRewriter()
         .on('a', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain)); } })
@@ -272,7 +266,6 @@ async function handleProxy(request, env) {
       );
     }
 
-    // ---------- CSS 重写 ----------
     if (contentType.includes('text/css')) {
       const cssText = await response.text();
       const rewritten = cssText
@@ -281,16 +274,14 @@ async function handleProxy(request, env) {
       return new Response(rewritten, { status: response.status, headers: respHeaders });
     }
 
-    // ---------- 其他资源 ----------
     return new Response(response.body, { status: response.status, headers: respHeaders });
-
   } catch (error) {
     console.error('[代理错误]', error.message);
     return new Response(`代理服务异常：${error.message}`, { status: 502 });
   }
 }
 
-// ---------- API 处理（加强版：批量删除） ----------
+// ---------- API 处理 ----------
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const method = request.method;
@@ -300,12 +291,11 @@ async function handleApi(request, env) {
     return jsonResponse({ status: 'ok', timestamp: Date.now() });
   }
 
-  // 提交域名（支持泛域名）
   if (method === 'POST' && path === '/api/domains') {
     try {
       const { domain } = await request.json();
       if (!domain || !/^[a-z0-9.*-]+$/i.test(domain)) {
-        return jsonResponse({ error: '域名格式无效，仅支持字母、数字、点、连字符和星号' }, 400);
+        return jsonResponse({ error: '域名格式无效' }, 400);
       }
       const pending = await env.DOMAINS_KV.get('pending_list', 'json') || [];
       const approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
@@ -326,7 +316,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 管理员获取待审列表
   if (method === 'GET' && path === '/api/admin/pending') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
@@ -338,7 +327,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 管理员获取已审核列表
   if (method === 'GET' && path === '/api/admin/approved') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
@@ -350,7 +338,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 管理员审核单个（通过/拒绝）
   if (method === 'POST' && path === '/api/admin/approve') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
@@ -379,7 +366,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 管理员删除单个已审核域名（拉黑）
   if (method === 'DELETE' && path === '/api/admin/approved') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
@@ -399,7 +385,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 管理员批量删除已审核域名
   if (method === 'DELETE' && path === '/api/admin/approved/batch') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
@@ -418,7 +403,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 获取友链（备用）
   if (method === 'GET' && path === '/api/friends') {
     try {
       const friends = env.FRIEND_LINKS ? JSON.parse(env.FRIEND_LINKS) : [];
@@ -431,9 +415,8 @@ async function handleApi(request, env) {
   return new Response('API 路径不存在', { status: 404 });
 }
 
-// ---------- 构建加强版 HTML (现代化UI) ----------
+// ---------- 构建 HTML（加强版 UI） ----------
 function buildAppHtml(domains, friendLinks) {
-  // 域名列表渲染（泛域名特殊标记）
   const domainItems = domains.map(d => {
     const isWildcard = d.startsWith('*.');
     if (isWildcard) {
@@ -466,7 +449,6 @@ function buildAppHtml(domains, friendLinks) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CLRA 导航 · 镜像</title>
   <style>
-    /* ---------- CSS 变量（深色/浅色自适应） ---------- */
     :root {
       --bg: #f0f4f8;
       --card-bg: rgba(255, 255, 255, 0.75);
@@ -504,7 +486,6 @@ function buildAppHtml(domains, friendLinks) {
         --badge-text: #0f172a;
       }
     }
-    /* ---------- 全局 ---------- */
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
@@ -516,7 +497,6 @@ function buildAppHtml(domains, friendLinks) {
       background-image: radial-gradient(circle at 10% 30%, rgba(37,99,235,0.05) 0%, transparent 60%),
                         radial-gradient(circle at 90% 70%, rgba(96,165,250,0.05) 0%, transparent 60%);
     }
-    /* ---------- 导航 ---------- */
     .navbar {
       position: fixed;
       top: 0;
@@ -564,13 +544,11 @@ function buildAppHtml(domains, friendLinks) {
       background: var(--link-color);
       color: white;
     }
-    /* ---------- 容器 ---------- */
     .container {
       max-width: 1100px;
       margin: 0 auto;
       padding: 1.5rem 1.5rem 3rem;
     }
-    /* ---------- 卡片 ---------- */
     .card {
       background: var(--card-bg);
       backdrop-filter: blur(16px);
@@ -590,7 +568,6 @@ function buildAppHtml(domains, friendLinks) {
       align-items: center;
       gap: 0.6rem;
     }
-    /* ---------- 搜索 ---------- */
     .search-box {
       width: 100%;
       padding: 0.9rem 1.4rem;
@@ -607,7 +584,6 @@ function buildAppHtml(domains, friendLinks) {
       border-color: var(--link-color);
       box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
     }
-    /* ---------- 域名标签 ---------- */
     .domain-grid {
       display: flex;
       flex-wrap: wrap;
@@ -645,7 +621,6 @@ function buildAppHtml(domains, friendLinks) {
       font-weight: 600;
       letter-spacing: 0.3px;
     }
-    /* ---------- 友链 ---------- */
     .friend-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
@@ -674,7 +649,6 @@ function buildAppHtml(domains, friendLinks) {
     }
     .friend-name { font-weight: 600; color: var(--text); font-size: 1.1rem; }
     .friend-domain { font-size: 0.85rem; color: var(--text-secondary); opacity: 0.7; }
-    /* ---------- 管理员 ---------- */
     .admin-key-area {
       display: flex;
       gap: 0.8rem;
@@ -722,7 +696,6 @@ function buildAppHtml(domains, friendLinks) {
     .btn-danger:hover { background: #b91c1c; }
     .btn-sm { padding: 0.3rem 1rem; font-size: 0.8rem; }
     .btn-xs { padding: 0.2rem 0.7rem; font-size: 0.7rem; }
-    /* ---------- 表格 ---------- */
     table {
       width: 100%;
       border-collapse: collapse;
@@ -751,7 +724,6 @@ function buildAppHtml(domains, friendLinks) {
     }
     .msg-success { background: #dcfce7; color: #166534; }
     .msg-error { background: #fee2e2; color: #991b1b; }
-    /* ---------- 页面切换 ---------- */
     .page { display: none; animation: fadeIn 0.3s ease; }
     .page.active { display: block; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -781,7 +753,6 @@ function buildAppHtml(domains, friendLinks) {
     .tab-content { display: none; }
     .tab-content.active { display: block; }
     .checkbox-all { margin-right: 0.5rem; }
-    /* ---------- 响应式 ---------- */
     @media (max-width: 640px) {
       .navbar { padding: 0 1rem; gap: 0.8rem; }
       .navbar .brand { font-size: 1rem; }
@@ -805,7 +776,6 @@ function buildAppHtml(domains, friendLinks) {
 
 <div class="container">
 
-  <!-- ====== 首页 ====== -->
   <div id="page-home" class="page active">
     <div class="card">
       <div class="card-title">📋 可用域名</div>
@@ -820,7 +790,6 @@ function buildAppHtml(domains, friendLinks) {
     </div>
   </div>
 
-  <!-- ====== 提交 ====== -->
   <div id="page-submit" class="page">
     <div class="card">
       <div class="card-title">✏️ 提交新域名</div>
@@ -833,7 +802,6 @@ function buildAppHtml(domains, friendLinks) {
     </div>
   </div>
 
-  <!-- ====== 审核 ====== -->
   <div id="page-admin" class="page">
     <div class="card">
       <div class="card-title">🔐 管理员审核</div>
@@ -847,7 +815,6 @@ function buildAppHtml(domains, friendLinks) {
     </div>
   </div>
 
-  <!-- ====== 友链 ====== -->
   <div id="page-friends" class="page">
     <div class="card">
       <div class="card-title">🔗 友情链接</div>
@@ -863,7 +830,7 @@ function buildAppHtml(domains, friendLinks) {
 </div>
 
 <script>
-  // ---------- 导航切换 ----------
+  // 导航切换
   document.querySelectorAll('.nav-link').forEach(btn => {
     btn.addEventListener('click', function() {
       document.querySelectorAll('.nav-link').forEach(b => b.classList.remove('active'));
@@ -874,7 +841,6 @@ function buildAppHtml(domains, friendLinks) {
     });
   });
 
-  // ---------- 搜索过滤 ----------
   function filterDomains() {
     const q = document.getElementById('searchInput').value.toLowerCase().trim();
     const links = document.querySelectorAll('#domainList .domain-link');
@@ -885,7 +851,7 @@ function buildAppHtml(domains, friendLinks) {
   }
   window.filterDomains = filterDomains;
 
-  // ---------- 泛域名随机点击 ----------
+  // 泛域名随机
   document.addEventListener('click', function(e) {
     const target = e.target.closest('.wildcard-domain');
     if (target) {
@@ -899,7 +865,7 @@ function buildAppHtml(domains, friendLinks) {
     }
   });
 
-  // ---------- 提交域名 ----------
+  // 提交域名
   document.getElementById('submitBtn').addEventListener('click', async function() {
     const input = document.getElementById('submitDomainInput');
     const domain = input.value.trim();
@@ -930,9 +896,8 @@ function buildAppHtml(domains, friendLinks) {
     setTimeout(() => { el.style.display = 'none'; }, 5000);
   }
 
-  // ---------- 管理员（带TAB和批量删除） ----------
+  // 管理员
   let currentAdminKey = '';
-
   document.getElementById('adminLoginBtn').addEventListener('click', async function() {
     const keyInput = document.getElementById('adminKeyInput');
     const key = keyInput.value.trim();
@@ -978,9 +943,8 @@ function buildAppHtml(domains, friendLinks) {
         });
         html += '</tbody></table>';
       }
-      html += '</div>'; // close pending-tab
+      html += '</div>';
 
-      // 已审核 tab（含批量删除）
       html += `
         <div id="approved-tab" class="tab-content">
           <h3 style="margin:0 0 1rem 0;">✅ 已审核域名</h3>
@@ -1002,11 +966,11 @@ function buildAppHtml(domains, friendLinks) {
         });
         html += '</tbody></table>';
       }
-      html += '</div>'; // close approved-tab
+      html += '</div>';
 
       container.innerHTML = html;
 
-      // ----- TAB 切换 -----
+      // Tab 切换
       container.querySelectorAll('.tab-btn').forEach(btn => {
         btn.addEventListener('click', function() {
           container.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -1017,7 +981,7 @@ function buildAppHtml(domains, friendLinks) {
         });
       });
 
-      // ----- 待审按钮事件 -----
+      // 待审操作
       container.querySelectorAll('[data-action]').forEach(btn => {
         btn.addEventListener('click', async function() {
           const domain = this.dataset.domain;
@@ -1045,7 +1009,7 @@ function buildAppHtml(domains, friendLinks) {
         });
       });
 
-      // ----- 单个删除已审核 -----
+      // 单个删除
       container.querySelectorAll('.delete-approved').forEach(btn => {
         btn.addEventListener('click', async function() {
           const domain = this.dataset.domain;
@@ -1072,7 +1036,7 @@ function buildAppHtml(domains, friendLinks) {
         });
       });
 
-      // ----- 全选/取消全选 -----
+      // 全选
       const selectAll = document.getElementById('selectAllApproved');
       if (selectAll) {
         selectAll.addEventListener('change', function() {
@@ -1081,7 +1045,7 @@ function buildAppHtml(domains, friendLinks) {
         });
       }
 
-      // ----- 批量删除 -----
+      // 批量删除
       const batchBtn = document.getElementById('batchDeleteBtn');
       if (batchBtn) {
         batchBtn.addEventListener('click', async function() {
