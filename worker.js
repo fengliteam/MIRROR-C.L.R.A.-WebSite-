@@ -1,5 +1,5 @@
 // ============================================================
-// CLRA Mirror - 强制全代理 + 泛域名支持 + 外链提示（修复版）
+// CLRA Mirror - 强制全代理 + 泛域名支持 + 外链提示 + www 自动匹配
 // ============================================================
 
 const CONFIG = {
@@ -49,42 +49,49 @@ function isRateLimited(ip) {
   return false;
 }
 
+// ---------- 增强白名单匹配（支持 www 自动继承） ----------
 function isDomainAllowed(domain, allowedList) {
   if (!Array.isArray(allowedList) || allowedList.length === 0) return false;
-  return allowedList.some(pattern => {
-    if (pattern === domain) return true;
-    if (pattern.startsWith('*.')) {
-      const suffix = pattern.slice(2);
-      return domain === suffix || domain.endsWith('.' + suffix);
-    }
-    return false;
-  });
+  
+  // 1. 精确匹配
+  if (allowedList.includes(domain)) return true;
+  
+  // 2. 泛域名匹配（*.example.com）
+  if (allowedList.some(p => p.startsWith('*.') && (domain === p.slice(2) || domain.endsWith('.' + p.slice(2))))) return true;
+  
+  // 3. 如果域名以 www. 开头，尝试匹配去掉前缀后的根域名
+  if (domain.startsWith('www.')) {
+    const base = domain.slice(4);
+    if (allowedList.includes(base)) return true;
+    // 根域名也支持泛域名
+    if (allowedList.some(p => p.startsWith('*.') && (base === p.slice(2) || base.endsWith('.' + p.slice(2))))) return true;
+  }
+  
+  return false;
 }
 
-// ---------- 核心：强制全代理，绝不返回原始链接 ----------
+// ---------- 强制全代理，绝不返回原始链接 ----------
 function rewriteUrl(originalUrl, domain) {
   if (!originalUrl || typeof originalUrl !== 'string') return originalUrl;
   if (/^(data|blob|javascript|mailto|tel|ws|wss):/i.test(originalUrl)) return originalUrl;
   if (originalUrl.startsWith('/proxy/')) return originalUrl;
 
-  // 处理相对协议
   let urlString = originalUrl;
   if (urlString.startsWith('//')) {
     urlString = 'https:' + urlString;
   }
 
-  // 尝试解析
-  let urlObj;
-  let targetDomain;
+  let targetDomain = '';
   let path = '';
   let search = '';
   let hash = '';
 
+  // 尝试解析
   try {
+    let urlObj;
     if (urlString.startsWith('http://') || urlString.startsWith('https://')) {
       urlObj = new URL(urlString);
     } else {
-      // 相对路径，基于当前域构建
       urlObj = new URL(urlString, `https://${domain}/`);
     }
     targetDomain = urlObj.hostname;
@@ -92,12 +99,10 @@ function rewriteUrl(originalUrl, domain) {
     search = urlObj.search || '';
     hash = urlObj.hash || '';
   } catch (_) {
-    // 解析失败（如泛域名 *.example.com），我们直接从原始字符串提取域名和路径
-    // 尝试提取域名：从 http:// 或 https:// 后到第一个 / 或 ? 或 #
+    // 解析失败（例如泛域名 *.example.com），手动提取
     let temp = urlString;
     if (temp.startsWith('http://')) temp = temp.slice(7);
     else if (temp.startsWith('https://')) temp = temp.slice(8);
-    // 分割域名和路径
     const slashIndex = temp.indexOf('/');
     const qIndex = temp.indexOf('?');
     const hashIndex = temp.indexOf('#');
@@ -107,7 +112,6 @@ function rewriteUrl(originalUrl, domain) {
     if (hashIndex > 0) endIndex = Math.min(endIndex, hashIndex);
     targetDomain = temp.slice(0, endIndex);
     const rest = temp.slice(endIndex);
-    // 分离路径、查询、哈希
     const queryMatch = rest.match(/^([^?#]*)(\?[^#]*)?(#.*)?$/);
     if (queryMatch) {
       path = queryMatch[1] || '/';
@@ -119,15 +123,12 @@ function rewriteUrl(originalUrl, domain) {
     if (!path.startsWith('/')) path = '/' + path;
   }
 
-  // 如果域名仍然无效（空或只有*），返回一个特殊标记，由代理层处理
   if (!targetDomain || targetDomain === '') {
     return '/proxy/blocked/';
   }
 
-  // 构建代理路径
   const proxyPath = `/proxy/${encodeURIComponent(targetDomain)}${path}${search}${hash}`;
   if (proxyPath.length > CONFIG.MAX_URL_LENGTH) {
-    // 过长则截断或返回特殊标记（但一般不会）
     return '/proxy/blocked/';
   }
   return proxyPath;
@@ -184,7 +185,7 @@ async function getDomainList(env) {
   return domainCache;
 }
 
-// ---------- 代理处理（含泛域名随机和外链提示） ----------
+// ---------- 代理处理 ----------
 async function handleProxy(request, env) {
   const url = new URL(request.url);
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -194,7 +195,6 @@ async function handleProxy(request, env) {
 
   const pathMatch = url.pathname.match(/^\/proxy\/([^\/]+)(\/.*)?$/);
   if (!pathMatch) {
-    // 特殊标记
     if (url.pathname === '/proxy/blocked/') {
       return new Response('无效的链接，无法解析为目标域名', { status: 400 });
     }
@@ -205,7 +205,7 @@ async function handleProxy(request, env) {
   const targetPath = pathMatch[2] || '/';
   const targetSearch = url.search || '';
 
-  // 处理泛域名：如果域名包含 *，随机生成子域名并重定向
+  // 泛域名随机子域名
   if (domain.includes('*')) {
     const random = Math.random().toString(36).substring(2, 10);
     let newDomain = domain.replace(/\*/g, random);
@@ -216,10 +216,9 @@ async function handleProxy(request, env) {
     });
   }
 
-  // 白名单检查
+  // 白名单检查（增强 www 自动匹配）
   const allowedDomains = await getDomainList(env);
   if (!isDomainAllowed(domain, allowedDomains)) {
-    // 返回中转提示页面
     const originalUrl = `https://${domain}${targetPath}${targetSearch}`;
     const html = `
       <!DOCTYPE html>
@@ -272,11 +271,14 @@ async function handleProxy(request, env) {
       redirect: 'manual',
     });
 
+    // ---------- 处理重定向 ----------
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('Location');
       if (location) {
         const newHeaders = new Headers(response.headers);
-        newHeaders.set('Location', rewriteUrl(location, domain));
+        // 重写 Location，并确保后续重定向后的域名也能通过白名单检查
+        const rewrittenLocation = rewriteUrl(location, domain);
+        newHeaders.set('Location', rewrittenLocation);
         return new Response(null, { status: response.status, headers: newHeaders });
       }
     }
@@ -286,6 +288,7 @@ async function handleProxy(request, env) {
     respHeaders.delete('content-security-policy');
     respHeaders.delete('content-security-policy-report-only');
 
+    // ---------- HTML 重写 ----------
     if (contentType.includes('text/html')) {
       const rewriter = new HTMLRewriter()
         .on('a', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain)); } })
@@ -344,6 +347,7 @@ async function handleProxy(request, env) {
       );
     }
 
+    // ---------- CSS 重写 ----------
     if (contentType.includes('text/css')) {
       const cssText = await response.text();
       const rewritten = cssText
@@ -359,7 +363,7 @@ async function handleProxy(request, env) {
   }
 }
 
-// ---------- API 处理（同前） ----------
+// ---------- API 处理 ----------
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const method = request.method;
@@ -493,7 +497,7 @@ async function handleApi(request, env) {
   return new Response('API 路径不存在', { status: 404 });
 }
 
-// ---------- 构建 HTML（UI 保持不变） ----------
+// ---------- 构建 HTML ----------
 function buildAppHtml(domains, friendLinks) {
   const domainItems = domains.map(d => {
     const isWildcard = d.startsWith('*.');
