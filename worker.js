@@ -1,5 +1,5 @@
 // ============================================================
-// CLRA Mirror - 最终修复版 (onclick 导航 + 外部资源直连 + 泛域名显示)
+// CLRA Mirror - 独立页面版（导航独立 + 外部资源直连）
 // ============================================================
 
 const CONFIG = {
@@ -20,7 +20,10 @@ const rateMap = new Map();
 
 // ---------- 工具函数 ----------
 function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 function escapeHtml(text) {
@@ -184,6 +187,9 @@ async function handleProxy(request, env) {
 
   const pathMatch = url.pathname.match(/^\/proxy\/([^\/]+)(\/.*)?$/);
   if (!pathMatch) {
+    if (url.pathname === '/proxy/blocked/') {
+      return new Response('无效的链接，无法解析为目标域名', { status: 400 });
+    }
     return new Response('无效的代理路径', { status: 400 });
   }
 
@@ -227,6 +233,12 @@ async function handleProxy(request, env) {
   } catch (_) {
     return new Response('目标 URL 格式错误', { status: 400 });
   }
+  if (targetUrl.href.length > CONFIG.MAX_URL_LENGTH) {
+    return new Response(
+      `目标链接过长，请直接访问：<a href="${targetUrl.href}">${targetUrl.href}</a>`,
+      { status: 414, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+    );
+  }
 
   const reqHeaders = new Headers(request.headers);
   ['cookie', 'authorization', 'proxy-authorization', 'x-forwarded-for', 'x-real-ip', 'cf-connecting-ip']
@@ -265,14 +277,21 @@ async function handleProxy(request, env) {
           function getProxyUrl(url) {
             if (!url || url.startsWith(proxyBase) || /^(data|blob|javascript|mailto|tel|ws|wss):/i.test(url)) return url;
             var fullUrl;
-            try { fullUrl = new URL(url, window.location.origin); } catch(e) { return url; }
+            try {
+              fullUrl = new URL(url, window.location.origin);
+            } catch(e) {
+              return url;
+            }
             if (fullUrl.pathname.startsWith(proxyBase)) return url;
             var domain = fullUrl.hostname;
             if (domain === window.location.hostname) {
               fullUrl = new URL(url, 'https://' + originalDomain + '/');
               domain = fullUrl.hostname;
             }
-            return proxyBase + encodeURIComponent(domain) + fullUrl.pathname + fullUrl.search + fullUrl.hash;
+            var path = fullUrl.pathname;
+            var search = fullUrl.search;
+            var hash = fullUrl.hash;
+            return proxyBase + encodeURIComponent(domain) + path + search + hash;
           }
           document.addEventListener('click', function(e) {
             var target = e.target.closest('a');
@@ -299,7 +318,9 @@ async function handleProxy(request, env) {
           window.open = function(url, name, features) {
             if (url) {
               var proxyUrl = getProxyUrl(url);
-              if (proxyUrl !== url) return originalOpen(proxyUrl, name, features);
+              if (proxyUrl !== url) {
+                return originalOpen(proxyUrl, name, features);
+              }
             }
             return originalOpen(url, name, features);
           };
@@ -308,18 +329,25 @@ async function handleProxy(request, env) {
       `;
 
       const rewriter = new HTMLRewriter()
-        .on('head', { element(el) { el.prepend(interceptorScript, { html: true }); } })
+        .on('head', {
+          element(el) {
+            el.prepend(interceptorScript, { html: true });
+          }
+        })
         .on('a', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain, false)); } })
         .on('form', { element(el) { const v = el.getAttribute('action'); if (v) el.setAttribute('action', rewriteUrl(v, domain, false)); } })
+        .on('area', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain, false)); } })
         .on('img', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true)); } })
-        .on('script', { element(el) {
-          const src = el.getAttribute('src');
-          if (src && (src.includes('static.cloudflareinsights.com') || src.includes('performance.radar.cloudflare.com'))) {
-            el.remove();
-          } else if (src) {
-            el.setAttribute('src', rewriteUrl(src, domain, true));
+        .on('script', {
+          element(el) {
+            const src = el.getAttribute('src');
+            if (src && (src.includes('static.cloudflareinsights.com') || src.includes('performance.radar.cloudflare.com'))) {
+              el.remove();
+            } else if (src) {
+              el.setAttribute('src', rewriteUrl(src, domain, true));
+            }
           }
-        }})
+        })
         .on('link', { element(el) {
           const rel = el.getAttribute('rel');
           if (['stylesheet', 'preload', 'preconnect', 'dns-prefetch', 'icon', 'apple-touch-icon'].includes(rel)) {
@@ -328,13 +356,17 @@ async function handleProxy(request, env) {
           }
         }})
         .on('source', { element(el) {
-          const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true));
+          const v = el.getAttribute('src');
+          if (v) el.setAttribute('src', rewriteUrl(v, domain, true));
           const srcset = el.getAttribute('srcset');
           if (srcset) {
             const newSrcset = srcset.split(',').map(part => {
               const trimmed = part.trim();
               const parts = trimmed.split(/\s+/);
-              if (parts.length > 0) { parts[0] = rewriteUrl(parts[0], domain, true); return parts.join(' '); }
+              if (parts.length > 0) {
+                parts[0] = rewriteUrl(parts[0], domain, true);
+                return parts.join(' ');
+              }
               return trimmed;
             }).join(', ');
             el.setAttribute('srcset', newSrcset);
@@ -350,17 +382,23 @@ async function handleProxy(request, env) {
             const content = el.getAttribute('content');
             if (content) {
               const match = content.match(/url=(.+)/i);
-              if (match) el.setAttribute('content', content.replace(/url=.+/i, `url=${rewriteUrl(match[1], domain, false)}`));
+              if (match) {
+                el.setAttribute('content', content.replace(/url=.+/i, `url=${rewriteUrl(match[1], domain, false)}`));
+              }
             }
           }
         }})
         .on('style', { text(text) {
-          const rewritten = text.text.replace(/url\((['"]?)([^'")]+)(['"]?)\)/g,
-            (_, q1, urlPart, q2) => `url(${q1}${rewriteUrl(urlPart.trim(), domain, true)}${q2})`);
+          const rewritten = text.text.replace(
+            /url\((['"]?)([^'")]+)(['"]?)\)/g,
+            (_, q1, urlPart, q2) => `url(${q1}${rewriteUrl(urlPart.trim(), domain, true)}${q2})`
+          );
           text.replace(rewritten);
         }});
 
-      return rewriter.transform(new Response(response.body, { status: response.status, headers: respHeaders }));
+      return rewriter.transform(
+        new Response(response.body, { status: response.status, headers: respHeaders })
+      );
     }
 
     if (contentType.includes('text/css')) {
@@ -395,35 +433,152 @@ function buildViewPage(domain, path, search, hash) {
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; background: #1e293b; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-    #toolbar { background: #0f172a; color: #f1f5f9; padding: 8px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-bottom: 1px solid #334155; flex-shrink: 0; }
-    #toolbar button { background: #334155; border: none; color: #f1f5f9; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: 0.2s; }
+    #toolbar {
+      background: #0f172a;
+      color: #f1f5f9;
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid #334155;
+      flex-shrink: 0;
+    }
+    #toolbar button {
+      background: #334155;
+      border: none;
+      color: #f1f5f9;
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: 0.2s;
+    }
     #toolbar button:hover { background: #475569; }
-    #address-bar { flex: 1; min-width: 200px; padding: 6px 12px; border-radius: 20px; border: 1px solid #475569; background: #1e293b; color: #f1f5f9; font-size: 14px; outline: none; }
+    #toolbar button:active { transform: scale(0.95); }
+    #address-bar {
+      flex: 1;
+      min-width: 200px;
+      padding: 6px 12px;
+      border-radius: 20px;
+      border: 1px solid #475569;
+      background: #1e293b;
+      color: #f1f5f9;
+      font-size: 14px;
+      outline: none;
+    }
     #address-bar:focus { border-color: #60a5fa; }
-    #iframe-container { flex: 1; background: #0f172a; }
-    iframe { width: 100%; height: 100%; border: none; background: #fff; }
-    .status-text { color: #94a3b8; font-size: 12px; margin-left: 8px; }
+    #iframe-container {
+      flex: 1;
+      background: #0f172a;
+    }
+    iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+      background: #fff;
+    }
+    .status-text {
+      color: #94a3b8;
+      font-size: 12px;
+      margin-left: 8px;
+    }
     @media (max-width: 640px) {
+      #toolbar { padding: 4px 8px; gap: 4px; }
+      #address-bar { font-size: 12px; padding: 4px 8px; }
       #toolbar button { width: 28px; height: 28px; font-size: 14px; }
     }
   </style>
 </head>
 <body>
   <div id="toolbar">
-    <button id="backBtn" title="后退" onclick="try{iframe.contentWindow.history.back()}catch(e){}">←</button>
-    <button id="forwardBtn" title="前进" onclick="try{iframe.contentWindow.history.forward()}catch(e){}">→</button>
-    <button id="refreshBtn" title="刷新" onclick="try{iframe.contentWindow.location.reload()}catch(e){}">⟳</button>
-    <input type="text" id="address-bar" value="${escapeHtml(displayUrl)}" spellcheck="false" onkeydown="if(event.key==='Enter'){let i=this.value.trim();if(!i)return;if(!i.startsWith('http'))i='https://'+i;try{let u=new URL(i);location.href='/view/'+encodeURIComponent(u.hostname)+u.pathname+u.search+u.hash}catch(e){alert('无效URL')}}" />
+    <button id="backBtn" title="后退">←</button>
+    <button id="forwardBtn" title="前进">→</button>
+    <button id="refreshBtn" title="刷新">⟳</button>
+    <input type="text" id="address-bar" value="${escapeHtml(displayUrl)}" spellcheck="false" />
     <span class="status-text" id="statusText">就绪</span>
   </div>
   <div id="iframe-container">
-    <iframe id="proxyFrame" src="${escapeHtml(proxySrc)}" onload="try{let f=document.getElementById('proxyFrame');let u=f.contentWindow.location;let m=u.pathname+u.search+u.hash;let r=m.match(/^\/proxy\/([^\/]+)(\/.*)?$/);if(r){document.getElementById('address-bar').value='https://'+r[1]+(r[2]||'/');document.getElementById('statusText').textContent='加载完成'}}catch(e){}" onerror="document.getElementById('statusText').textContent='加载失败'"></iframe>
+    <iframe id="proxyFrame" src="${escapeHtml(proxySrc)}"></iframe>
   </div>
+
+  <script>
+    (function() {
+      var iframe = document.getElementById('proxyFrame');
+      var addressBar = document.getElementById('address-bar');
+      var statusText = document.getElementById('statusText');
+      var backBtn = document.getElementById('backBtn');
+      var forwardBtn = document.getElementById('forwardBtn');
+      var refreshBtn = document.getElementById('refreshBtn');
+
+      function updateAddress() {
+        try {
+          var frameUrl = iframe.contentWindow.location.href;
+          if (frameUrl) {
+            var urlObj = new URL(frameUrl);
+            var path = urlObj.pathname + urlObj.search + urlObj.hash;
+            var match = path.match(/^\/proxy\/([^\/]+)(\/.*)?$/);
+            if (match) {
+              var domain = match[1];
+              var rest = match[2] || '/';
+              addressBar.value = 'https://' + domain + rest;
+              statusText.textContent = '加载完成';
+            } else {
+              addressBar.value = frameUrl;
+            }
+          }
+        } catch(e) {}
+      }
+
+      iframe.addEventListener('load', function() {
+        setTimeout(updateAddress, 100);
+        statusText.textContent = '加载中...';
+      });
+
+      addressBar.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+          var input = addressBar.value.trim();
+          if (!input) return;
+          if (!input.startsWith('http://') && !input.startsWith('https://')) {
+            input = 'https://' + input;
+          }
+          try {
+            var urlObj = new URL(input);
+            var domain = urlObj.hostname;
+            var path = urlObj.pathname + urlObj.search + urlObj.hash;
+            var viewPath = '/view/' + encodeURIComponent(domain) + path;
+            window.location.href = viewPath;
+          } catch(e) {
+            alert('无效的 URL');
+          }
+        }
+      });
+
+      backBtn.addEventListener('click', function() {
+        try { iframe.contentWindow.history.back(); } catch(e) {}
+      });
+      forwardBtn.addEventListener('click', function() {
+        try { iframe.contentWindow.history.forward(); } catch(e) {}
+      });
+      refreshBtn.addEventListener('click', function() {
+        try { iframe.contentWindow.location.reload(); } catch(e) {}
+      });
+
+      iframe.addEventListener('error', function() {
+        statusText.textContent = '加载失败';
+      });
+      setTimeout(updateAddress, 300);
+    })();
+  </script>
 </body>
 </html>`;
 }
 
-// ---------- API 处理 (不变，省略重复部分) ----------
+// ---------- API 处理 ----------
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const method = request.method;
@@ -436,29 +591,48 @@ async function handleApi(request, env) {
   if (method === 'POST' && path === '/api/domains') {
     try {
       const { domain } = await request.json();
-      if (!domain || !/^[a-z0-9.*-]+$/i.test(domain)) return jsonResponse({ error: '域名格式无效' }, 400);
+      if (!domain || !/^[a-z0-9.*-]+$/i.test(domain)) {
+        return jsonResponse({ error: '域名格式无效' }, 400);
+      }
       const pending = await env.DOMAINS_KV.get('pending_list', 'json') || [];
       const approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
-      if (pending.some(item => item.domain === domain) || approved.includes(domain)) return jsonResponse({ error: '该域名已提交或已通过审核' }, 409);
+      if (pending.some(item => item.domain === domain) || approved.includes(domain)) {
+        return jsonResponse({ error: '该域名已提交或已通过审核' }, 409);
+      }
       const submitter = request.headers.get('CF-Connecting-IP') || 'unknown';
-      pending.push({ id: crypto.randomUUID(), domain, submitter, time: Date.now() });
+      pending.push({
+        id: crypto.randomUUID(),
+        domain,
+        submitter,
+        time: Date.now(),
+      });
       await env.DOMAINS_KV.put('pending_list', JSON.stringify(pending));
       return jsonResponse({ success: true, message: '提交成功，等待管理员审核' }, 201);
-    } catch (_) { return jsonResponse({ error: '请求体格式错误' }, 400); }
+    } catch (_) {
+      return jsonResponse({ error: '请求体格式错误' }, 400);
+    }
   }
 
   if (method === 'GET' && path === '/api/admin/pending') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
-    const pending = await env.DOMAINS_KV.get('pending_list', 'json') || [];
-    return jsonResponse(pending);
+    try {
+      const pending = await env.DOMAINS_KV.get('pending_list', 'json') || [];
+      return jsonResponse(pending);
+    } catch (_) {
+      return jsonResponse({ error: '服务器读取失败' }, 500);
+    }
   }
 
   if (method === 'GET' && path === '/api/admin/approved') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
-    const approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
-    return jsonResponse(approved);
+    try {
+      const approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
+      return jsonResponse(approved);
+    } catch (_) {
+      return jsonResponse({ error: '服务器读取失败' }, 500);
+    }
   }
 
   if (method === 'POST' && path === '/api/admin/approve') {
@@ -466,10 +640,14 @@ async function handleApi(request, env) {
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
     try {
       const { domain, action } = await request.json();
-      if (!domain || !['approve', 'reject'].includes(action)) return jsonResponse({ error: '参数无效' }, 400);
+      if (!domain || !['approve', 'reject'].includes(action)) {
+        return jsonResponse({ error: '参数无效' }, 400);
+      }
       let pending = await env.DOMAINS_KV.get('pending_list', 'json') || [];
       const index = pending.findIndex(item => item.domain === domain);
-      if (index === -1) return jsonResponse({ error: '未找到该待审域名' }, 404);
+      if (index === -1) {
+        return jsonResponse({ error: '未找到该待审域名' }, 404);
+      }
       pending.splice(index, 1);
       await env.DOMAINS_KV.put('pending_list', JSON.stringify(pending));
       if (action === 'approve') {
@@ -480,44 +658,379 @@ async function handleApi(request, env) {
         }
       }
       return jsonResponse({ success: true });
-    } catch (_) { return jsonResponse({ error: '请求处理异常' }, 400); }
+    } catch (_) {
+      return jsonResponse({ error: '请求处理异常' }, 400);
+    }
   }
 
   if (method === 'DELETE' && path === '/api/admin/approved') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
-    const { domain } = await request.json();
-    if (!domain) return jsonResponse({ error: '缺少域名参数' }, 400);
-    let approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
-    const index = approved.indexOf(domain);
-    if (index === -1) return jsonResponse({ error: '该域名不在已审核列表中' }, 404);
-    approved.splice(index, 1);
-    await env.DOMAINS_KV.put('approved_list', JSON.stringify(approved));
-    return jsonResponse({ success: true, message: '已从白名单移除' });
+    try {
+      const { domain } = await request.json();
+      if (!domain) return jsonResponse({ error: '缺少域名参数' }, 400);
+      let approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
+      const index = approved.indexOf(domain);
+      if (index === -1) {
+        return jsonResponse({ error: '该域名不在已审核列表中' }, 404);
+      }
+      approved.splice(index, 1);
+      await env.DOMAINS_KV.put('approved_list', JSON.stringify(approved));
+      return jsonResponse({ success: true, message: '已从白名单移除' });
+    } catch (_) {
+      return jsonResponse({ error: '请求处理异常' }, 400);
+    }
   }
 
   if (method === 'DELETE' && path === '/api/admin/approved/batch') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
-    const { domains } = await request.json();
-    if (!Array.isArray(domains) || domains.length === 0) return jsonResponse({ error: '请提供要删除的域名列表' }, 400);
-    let approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
-    const toRemove = new Set(domains);
-    const newApproved = approved.filter(d => !toRemove.has(d));
-    await env.DOMAINS_KV.put('approved_list', JSON.stringify(newApproved));
-    return jsonResponse({ success: true, message: `成功移除 ${approved.length - newApproved.length} 个域名` });
+    try {
+      const { domains } = await request.json();
+      if (!Array.isArray(domains) || domains.length === 0) {
+        return jsonResponse({ error: '请提供要删除的域名列表' }, 400);
+      }
+      let approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
+      const toRemove = new Set(domains);
+      const newApproved = approved.filter(d => !toRemove.has(d));
+      await env.DOMAINS_KV.put('approved_list', JSON.stringify(newApproved));
+      return jsonResponse({ success: true, message: `成功移除 ${approved.length - newApproved.length} 个域名` });
+    } catch (_) {
+      return jsonResponse({ error: '请求处理异常' }, 400);
+    }
   }
 
   if (method === 'GET' && path === '/api/friends') {
-    try { const friends = env.FRIEND_LINKS ? JSON.parse(env.FRIEND_LINKS) : []; return jsonResponse(friends); }
-    catch (_) { return jsonResponse([]); }
+    try {
+      const friends = env.FRIEND_LINKS ? JSON.parse(env.FRIEND_LINKS) : [];
+      return jsonResponse(friends);
+    } catch (_) {
+      return jsonResponse([]);
+    }
   }
 
   return new Response('API 路径不存在', { status: 404 });
 }
 
-// ---------- 构建首页 HTML（onclick 导航，各卡片独立） ----------
-function buildAppHtml(domains, friendLinks) {
+// ---------- 公共样式 / 布局 ----------
+const SHARED_STYLES = `
+  :root {
+    --bg: #f0f4f8;
+    --card-bg: rgba(255, 255, 255, 0.75);
+    --text: #0f172a;
+    --text-secondary: #475569;
+    --border: rgba(255, 255, 255, 0.5);
+    --shadow: 0 30px 60px -20px rgba(0,0,0,0.25);
+    --nav-bg: rgba(255, 255, 255, 0.6);
+    --link-color: #2563eb;
+    --link-hover: #1d4ed8;
+    --input-bg: rgba(255,255,255,0.9);
+    --input-border: #e2e8f0;
+    --tag-bg: rgba(37, 99, 235, 0.08);
+    --tag-border: rgba(37, 99, 235, 0.15);
+    --badge-bg: #2563eb;
+    --badge-text: #fff;
+    --transition: 0.25s;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f172a;
+      --card-bg: rgba(30, 41, 59, 0.8);
+      --text: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --border: rgba(255, 255, 255, 0.1);
+      --shadow: 0 30px 60px -20px rgba(0,0,0,0.6);
+      --nav-bg: rgba(15, 23, 42, 0.8);
+      --link-color: #60a5fa;
+      --link-hover: #93bbfc;
+      --input-bg: rgba(30, 41, 59, 0.8);
+      --input-border: #334155;
+      --tag-bg: rgba(96, 165, 250, 0.12);
+      --tag-border: rgba(96, 165, 250, 0.2);
+      --badge-bg: #60a5fa;
+      --badge-text: #0f172a;
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    transition: background 0.3s, color 0.3s;
+    padding-top: 70px;
+    background-image: radial-gradient(circle at 10% 30%, rgba(37,99,235,0.05) 0%, transparent 60%),
+                      radial-gradient(circle at 90% 70%, rgba(96,165,250,0.05) 0%, transparent 60%);
+  }
+  .navbar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1000;
+    background: var(--nav-bg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 2rem;
+    height: 64px;
+    gap: 1.5rem;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    box-shadow: 0 2px 20px rgba(0,0,0,0.06);
+  }
+  .navbar .brand {
+    font-weight: 700;
+    font-size: 1.3rem;
+    color: var(--text);
+    text-decoration: none;
+    white-space: nowrap;
+    margin-right: auto;
+    letter-spacing: -0.5px;
+  }
+  .navbar .brand span { color: var(--link-color); }
+  .nav-link {
+    color: var(--text-secondary);
+    text-decoration: none;
+    font-weight: 500;
+    padding: 0.4rem 1rem;
+    border-radius: 40px;
+    transition: var(--transition);
+    white-space: nowrap;
+    cursor: pointer;
+    background: transparent;
+    border: none;
+    font-size: 0.95rem;
+    display: inline-block;
+  }
+  .nav-link:hover { background: var(--tag-bg); color: var(--text); }
+  .nav-link.active {
+    background: var(--link-color);
+    color: white;
+  }
+  .container {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 1.5rem 1.5rem 3rem;
+  }
+  .card {
+    background: var(--card-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-radius: 2.5rem;
+    padding: 2rem;
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    margin-bottom: 2rem;
+    transition: var(--transition);
+  }
+  .card-title {
+    font-size: 1.6rem;
+    font-weight: 600;
+    margin-bottom: 1.2rem;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .search-box {
+    width: 100%;
+    padding: 0.9rem 1.4rem;
+    border-radius: 60px;
+    border: 1px solid var(--input-border);
+    background: var(--input-bg);
+    color: var(--text);
+    font-size: 1rem;
+    outline: none;
+    transition: var(--transition);
+    margin-bottom: 1.5rem;
+  }
+  .search-box:focus {
+    border-color: var(--link-color);
+    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
+  }
+  .domain-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.7rem;
+    max-height: 420px;
+    overflow-y: auto;
+    padding: 0.2rem 0;
+  }
+  .domain-link {
+    background: var(--tag-bg);
+    border: 1px solid var(--tag-border);
+    padding: 0.4rem 1.2rem;
+    border-radius: 40px;
+    color: var(--text);
+    text-decoration: none;
+    font-size: 0.9rem;
+    transition: var(--transition);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    cursor: pointer;
+  }
+  .domain-link:hover {
+    background: var(--link-color);
+    color: white;
+    transform: scale(1.04);
+    border-color: var(--link-color);
+  }
+  .friend-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 1.2rem;
+  }
+  .friend-item {
+    background: var(--tag-bg);
+    border: 1px solid var(--tag-border);
+    border-radius: 1.5rem;
+    padding: 1rem 1.2rem;
+    transition: var(--transition);
+  }
+  .friend-item:hover {
+    background: var(--link-color);
+    border-color: var(--link-color);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 20px rgba(37,99,235,0.15);
+  }
+  .friend-item:hover .friend-name,
+  .friend-item:hover .friend-domain { color: white; }
+  .friend-link {
+    text-decoration: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  .friend-name { font-weight: 600; color: var(--text); font-size: 1.1rem; }
+  .friend-domain { font-size: 0.85rem; color: var(--text-secondary); opacity: 0.7; }
+  .admin-key-area {
+    display: flex;
+    gap: 0.8rem;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-bottom: 1.5rem;
+  }
+  .admin-key-area input {
+    flex: 1;
+    min-width: 200px;
+    padding: 0.8rem 1.2rem;
+    border-radius: 60px;
+    border: 1px solid var(--input-border);
+    background: var(--input-bg);
+    color: var(--text);
+    outline: none;
+    transition: var(--transition);
+  }
+  .admin-key-area input:focus {
+    border-color: var(--link-color);
+    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
+  }
+  .btn {
+    padding: 0.8rem 2rem;
+    border: none;
+    border-radius: 60px;
+    font-weight: 600;
+    background: var(--link-color);
+    color: white;
+    cursor: pointer;
+    transition: var(--transition);
+    white-space: nowrap;
+    font-size: 0.95rem;
+  }
+  .btn:hover { background: var(--link-hover); transform: scale(1.02); }
+  .btn-outline {
+    background: transparent;
+    border: 1px solid var(--input-border);
+    color: var(--text);
+  }
+  .btn-outline:hover { background: var(--tag-bg); }
+  .btn-success { background: #16a34a; }
+  .btn-success:hover { background: #15803d; }
+  .btn-danger { background: #dc2626; }
+  .btn-danger:hover { background: #b91c1c; }
+  .btn-sm { padding: 0.3rem 1rem; font-size: 0.8rem; }
+  .btn-xs { padding: 0.2rem 0.7rem; font-size: 0.7rem; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+  }
+  th {
+    text-align: left;
+    padding: 0.7rem 0.5rem;
+    color: var(--text-secondary);
+    border-bottom: 2px solid var(--input-border);
+  }
+  td {
+    padding: 0.7rem 0.5rem;
+    border-bottom: 1px solid var(--input-border);
+  }
+  .msg {
+    padding: 0.5rem 1rem;
+    border-radius: 60px;
+    margin-top: 0.8rem;
+    display: none;
+  }
+  .msg-success { background: #dcfce7; color: #166534; }
+  .msg-error { background: #fee2e2; color: #991b1b; }
+  .tab-bar {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+    border-bottom: 2px solid var(--input-border);
+    padding-bottom: 0.5rem;
+  }
+  .tab-btn {
+    background: transparent;
+    border: none;
+    padding: 0.5rem 1.2rem;
+    border-radius: 30px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: var(--transition);
+  }
+  .tab-btn.active {
+    background: var(--link-color);
+    color: white;
+  }
+  .tab-btn:hover:not(.active) { background: var(--tag-bg); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .checkbox-all { margin-right: 0.5rem; }
+  @media (max-width: 640px) {
+    .navbar { padding: 0 1rem; gap: 0.8rem; }
+    .navbar .brand { font-size: 1rem; }
+    .nav-link { font-size: 0.85rem; padding: 0.3rem 0.6rem; }
+    .container { padding: 1rem; }
+    .card { padding: 1.2rem; }
+    .friend-grid { grid-template-columns: 1fr 1fr; }
+    .admin-key-area { flex-direction: column; }
+  }
+`;
+
+function navLinks(activePath) {
+  const links = [
+    { href: '/', text: '首页', page: 'home' },
+    { href: '/submit', text: '提交', page: 'submit' },
+    { href: '/admin', text: '审核', page: 'admin' },
+    { href: '/friends', text: '友链', page: 'friends' },
+  ];
+  let html = '';
+  links.forEach(link => {
+    const activeClass = activePath === link.href ? ' active' : '';
+    html += `<a href="${link.href}" class="nav-link${activeClass}">${link.text}</a>`;
+  });
+  // 浏览器入口
+  html += `<a href="/view/clra1.lzh173.chat/" class="nav-link" target="_blank">浏览器</a>`;
+  return html;
+}
+
+// ---------- 首页 ----------
+function buildHomePage(domains) {
   const domainItems = domains.map(d => {
     if (d.startsWith('*.')) {
       const base = d.slice(2);
@@ -529,313 +1042,74 @@ function buildAppHtml(domains, friendLinks) {
     }
   }).join('');
 
-  const friendItems = (friendLinks || []).map(f => {
-    const name = escapeHtml(f.name || f.url);
-    const url = f.url;
-    let domain = url.replace(/^https?:\/\//, '').split('/')[0];
-    const viewUrl = `/view/${encodeURIComponent(domain)}/`;
-    return `
-      <div class="friend-item">
-        <a href="${viewUrl}" target="_blank" class="friend-link">
-          <span class="friend-name">${name}</span>
-          <span class="friend-domain">${escapeHtml(domain)}</span>
-        </a>
-      </div>
-    `;
-  }).join('');
-
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CLRA 导航 · 镜像</title>
-  <style>
-    :root {
-      --bg: #f0f4f8;
-      --card-bg: rgba(255, 255, 255, 0.75);
-      --text: #0f172a;
-      --text-secondary: #475569;
-      --border: rgba(255, 255, 255, 0.5);
-      --shadow: 0 30px 60px -20px rgba(0,0,0,0.25);
-      --nav-bg: rgba(255, 255, 255, 0.6);
-      --link-color: #2563eb;
-      --link-hover: #1d4ed8;
-      --input-bg: rgba(255,255,255,0.9);
-      --input-border: #e2e8f0;
-      --tag-bg: rgba(37, 99, 235, 0.08);
-      --tag-border: rgba(37, 99, 235, 0.15);
-      --transition: 0.25s;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #0f172a;
-        --card-bg: rgba(30, 41, 59, 0.8);
-        --text: #f1f5f9;
-        --text-secondary: #94a3b8;
-        --border: rgba(255, 255, 255, 0.1);
-        --shadow: 0 30px 60px -20px rgba(0,0,0,0.6);
-        --nav-bg: rgba(15, 23, 42, 0.8);
-        --link-color: #60a5fa;
-        --link-hover: #93bbfc;
-        --input-bg: rgba(30, 41, 59, 0.8);
-        --input-border: #334155;
-        --tag-bg: rgba(96, 165, 250, 0.12);
-        --tag-border: rgba(96, 165, 250, 0.2);
-      }
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      padding-top: 70px;
-      background-image: radial-gradient(circle at 10% 30%, rgba(37,99,235,0.05) 0%, transparent 60%),
-                        radial-gradient(circle at 90% 70%, rgba(96,165,250,0.05) 0%, transparent 60%);
-    }
-    .navbar {
-      position: fixed;
-      top: 0; left: 0; right: 0;
-      z-index: 1000;
-      background: var(--nav-bg);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      padding: 0 2rem;
-      height: 64px;
-      gap: 1.5rem;
-      overflow-x: auto;
-      box-shadow: 0 2px 20px rgba(0,0,0,0.06);
-    }
-    .navbar .brand {
-      font-weight: 700;
-      font-size: 1.3rem;
-      color: var(--text);
-      text-decoration: none;
-      white-space: nowrap;
-      margin-right: auto;
-      letter-spacing: -0.5px;
-    }
-    .navbar .brand span { color: var(--link-color); }
-    .nav-link {
-      color: var(--text-secondary);
-      text-decoration: none;
-      font-weight: 500;
-      padding: 0.4rem 1rem;
-      border-radius: 40px;
-      transition: var(--transition);
-      white-space: nowrap;
-      cursor: pointer;
-      background: transparent;
-      border: none;
-      font-size: 0.95rem;
-    }
-    .nav-link:hover { background: var(--tag-bg); color: var(--text); }
-    .nav-link.active { background: var(--link-color); color: white; }
-    .container { max-width: 1100px; margin: 0 auto; padding: 1.5rem 1.5rem 3rem; }
-    .card {
-      background: var(--card-bg);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border-radius: 2.5rem;
-      padding: 2rem;
-      border: 1px solid var(--border);
-      box-shadow: var(--shadow);
-      margin-bottom: 2rem;
-      transition: var(--transition);
-    }
-    .card-title { font-size: 1.6rem; font-weight: 600; margin-bottom: 1.2rem; display: flex; align-items: center; gap: 0.6rem; }
-    .search-box {
-      width: 100%;
-      padding: 0.9rem 1.4rem;
-      border-radius: 60px;
-      border: 1px solid var(--input-border);
-      background: var(--input-bg);
-      color: var(--text);
-      font-size: 1rem;
-      outline: none;
-      transition: var(--transition);
-      margin-bottom: 1.5rem;
-    }
-    .search-box:focus { border-color: var(--link-color); box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12); }
-    .domain-grid {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.7rem;
-      max-height: 420px;
-      overflow-y: auto;
-      padding: 0.2rem 0;
-    }
-    .domain-link {
-      background: var(--tag-bg);
-      border: 1px solid var(--tag-border);
-      padding: 0.4rem 1.2rem;
-      border-radius: 40px;
-      color: var(--text);
-      text-decoration: none;
-      font-size: 0.9rem;
-      transition: var(--transition);
-      display: inline-flex;
-      align-items: center;
-      gap: 0.3rem;
-    }
-    .domain-link:hover { background: var(--link-color); color: white; transform: scale(1.04); border-color: var(--link-color); }
-    .friend-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1.2rem; }
-    .friend-item {
-      background: var(--tag-bg);
-      border: 1px solid var(--tag-border);
-      border-radius: 1.5rem;
-      padding: 1rem 1.2rem;
-      transition: var(--transition);
-    }
-    .friend-item:hover { background: var(--link-color); border-color: var(--link-color); transform: translateY(-2px); box-shadow: 0 8px 20px rgba(37,99,235,0.15); }
-    .friend-item:hover .friend-name,
-    .friend-item:hover .friend-domain { color: white; }
-    .friend-link { text-decoration: none; display: flex; flex-direction: column; gap: 0.2rem; }
-    .friend-name { font-weight: 600; color: var(--text); font-size: 1.1rem; }
-    .friend-domain { font-size: 0.85rem; color: var(--text-secondary); opacity: 0.7; }
-    .admin-key-area { display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: center; margin-bottom: 1.5rem; }
-    .admin-key-area input {
-      flex: 1; min-width: 200px; padding: 0.8rem 1.2rem; border-radius: 60px;
-      border: 1px solid var(--input-border); background: var(--input-bg); color: var(--text); outline: none; transition: var(--transition);
-    }
-    .admin-key-area input:focus { border-color: var(--link-color); box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12); }
-    .btn {
-      padding: 0.8rem 2rem; border: none; border-radius: 60px; font-weight: 600;
-      background: var(--link-color); color: white; cursor: pointer; transition: var(--transition);
-      white-space: nowrap; font-size: 0.95rem;
-    }
-    .btn:hover { background: var(--link-hover); transform: scale(1.02); }
-    .btn-success { background: #16a34a; } .btn-success:hover { background: #15803d; }
-    .btn-danger { background: #dc2626; } .btn-danger:hover { background: #b91c1c; }
-    .btn-sm { padding: 0.3rem 1rem; font-size: 0.8rem; }
-    .btn-xs { padding: 0.2rem 0.7rem; font-size: 0.7rem; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
-    th { text-align: left; padding: 0.7rem 0.5rem; color: var(--text-secondary); border-bottom: 2px solid var(--input-border); }
-    td { padding: 0.7rem 0.5rem; border-bottom: 1px solid var(--input-border); }
-    .msg { padding: 0.5rem 1rem; border-radius: 60px; margin-top: 0.8rem; display: none; }
-    .msg-success { background: #dcfce7; color: #166534; }
-    .msg-error { background: #fee2e2; color: #991b1b; }
-    .page { display: none; animation: fadeIn 0.3s ease; }
-    .page.active { display: block; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-    .tab-bar { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; border-bottom: 2px solid var(--input-border); padding-bottom: 0.5rem; }
-    .tab-btn {
-      background: transparent; border: none; padding: 0.5rem 1.2rem; border-radius: 30px;
-      font-weight: 500; color: var(--text-secondary); cursor: pointer; transition: var(--transition);
-    }
-    .tab-btn.active { background: var(--link-color); color: white; }
-    .tab-btn:hover:not(.active) { background: var(--tag-bg); }
-    .tab-content { display: none; }
-    .tab-content.active { display: block; }
-    .checkbox-all { margin-right: 0.5rem; }
-    @media (max-width: 640px) {
-      .navbar { padding: 0 1rem; gap: 0.8rem; }
-      .navbar .brand { font-size: 1rem; }
-      .nav-link { font-size: 0.85rem; padding: 0.3rem 0.6rem; }
-      .container { padding: 1rem; }
-      .card { padding: 1.2rem; }
-    }
-  </style>
+  <style>${SHARED_STYLES}</style>
 </head>
 <body>
-
 <nav class="navbar">
   <a href="/" class="brand">🌐 <span>CLRA</span></a>
-  <button type="button" class="nav-link active" data-page="home" onclick="switchPage('home')">首页</button>
-  <button type="button" class="nav-link" data-page="submit" onclick="switchPage('submit')">提交</button>
-  <button type="button" class="nav-link" data-page="admin" onclick="switchPage('admin')">审核</button>
-  <button type="button" class="nav-link" data-page="friends" onclick="switchPage('friends')">友链</button>
-  <a href="/view/clra1.lzh173.chat/" class="nav-link" target="_blank">浏览器</a>
+  ${navLinks('/')}
 </nav>
-
 <div class="container">
-
-  <div id="page-home" class="page active">
-    <div class="card">
-      <div class="card-title">📋 可用域名</div>
-      <input type="text" id="searchInput" class="search-box" placeholder="搜索域名..." oninput="filterDomains()">
-      <div id="domainList" class="domain-grid">
-        ${domainItems}
-      </div>
-      <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:1rem;">
-        共 <strong>${domains.length}</strong> 个域名
-      </div>
-    </div>
+  <div class="card">
+    <div class="card-title">📋 可用域名</div>
+    <input type="text" id="searchInput" class="search-box" placeholder="搜索域名..." oninput="filterDomains()">
+    <div id="domainList" class="domain-grid">${domainItems}</div>
+    <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:1rem;">共 <strong>${domains.length}</strong> 个域名</div>
   </div>
-
-  <div id="page-submit" class="page">
-    <div class="card">
-      <div class="card-title">✏️ 提交新域名</div>
-      <p style="color:var(--text-secondary); margin-bottom:1.2rem;">支持泛域名，如 <code>*.example.com</code></p>
-      <div style="display:flex; gap:0.8rem; flex-wrap:wrap;">
-        <input type="text" id="submitDomainInput" class="search-box" style="flex:1; min-width:200px;" placeholder="example.com 或 *.example.com">
-        <button type="button" class="btn" id="submitBtn" onclick="submitDomain()">提交审核</button>
-      </div>
-      <div id="submitMsg" class="msg"></div>
-    </div>
-  </div>
-
-  <div id="page-admin" class="page">
-    <div class="card">
-      <div class="card-title">🔐 管理员审核</div>
-      <div class="admin-key-area">
-        <input type="password" id="adminKeyInput" placeholder="管理密钥">
-        <button type="button" class="btn" id="adminLoginBtn" onclick="loadAdmin()">加载数据</button>
-      </div>
-      <div id="adminContent">
-        <p style="color:var(--text-secondary);">输入密钥后点击加载</p>
-      </div>
-    </div>
-  </div>
-
-  <div id="page-friends" class="page">
-    <div class="card">
-      <div class="card-title">🔗 友情链接</div>
-      <div class="friend-grid">
-        ${friendItems || '<p style="color:var(--text-secondary);">暂无友链，请在环境变量中配置 FRIEND_LINKS</p>'}
-      </div>
-    </div>
-  </div>
-
 </div>
-
 <script>
-  // 客户端 escapeHtml
-  function escapeHtml(text) {
-    if (!text) return '';
-    var div = document.createElement('div');
-    div.appendChild(document.createTextNode(text));
-    return div.innerHTML;
-  }
-
-  // 导航切换
-  function switchPage(page) {
-    document.querySelectorAll('.nav-link[data-page]').forEach(function(b) {
-      b.classList.remove('active');
-    });
-    var btn = document.querySelector('.nav-link[data-page="' + page + '"]');
-    if (btn) btn.classList.add('active');
-    document.querySelectorAll('.page').forEach(function(p) {
-      p.classList.remove('active');
-    });
-    var target = document.getElementById('page-' + page);
-    if (target) target.classList.add('active');
-  }
-
   function filterDomains() {
     var q = document.getElementById('searchInput').value.toLowerCase().trim();
     var links = document.querySelectorAll('#domainList .domain-link');
     links.forEach(function(link) {
-      var text = link.textContent.toLowerCase();
-      link.style.display = text.includes(q) ? 'inline-flex' : 'none';
+      link.style.display = link.textContent.toLowerCase().includes(q) ? 'inline-flex' : 'none';
     });
   }
+</script>
+</body>
+</html>`;
+}
 
-  async function submitDomain() {
+// ---------- 提交页面 ----------
+function buildSubmitPage() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>提交域名 - CLRA</title>
+  <style>${SHARED_STYLES}</style>
+</head>
+<body>
+<nav class="navbar">
+  <a href="/" class="brand">🌐 <span>CLRA</span></a>
+  ${navLinks('/submit')}
+</nav>
+<div class="container">
+  <div class="card">
+    <div class="card-title">✏️ 提交新域名</div>
+    <p style="color:var(--text-secondary); margin-bottom:1.2rem;">支持泛域名，如 <code>*.example.com</code></p>
+    <div style="display:flex; gap:0.8rem; flex-wrap:wrap;">
+      <input type="text" id="submitDomainInput" class="search-box" style="flex:1; min-width:200px;" placeholder="example.com 或 *.example.com">
+      <button type="button" class="btn" id="submitBtn">提交审核</button>
+    </div>
+    <div id="submitMsg" class="msg"></div>
+  </div>
+</div>
+<script>
+  function showMsg(el, text, type) {
+    el.textContent = text;
+    el.className = 'msg msg-' + type;
+    el.style.display = 'block';
+    setTimeout(function() { el.style.display = 'none'; }, 5000);
+  }
+  document.getElementById('submitBtn').addEventListener('click', async function() {
     var input = document.getElementById('submitDomainInput');
     var domain = input.value.trim();
     var msg = document.getElementById('submitMsg');
@@ -856,17 +1130,48 @@ function buildAppHtml(domains, friendLinks) {
     } catch {
       showMsg(msg, '❌ 网络错误', 'error');
     }
-  }
+  });
+</script>
+</body>
+</html>`;
+}
 
-  function showMsg(el, text, type) {
-    el.textContent = text;
-    el.className = 'msg msg-' + type;
-    el.style.display = 'block';
-    setTimeout(function() { el.style.display = 'none'; }, 5000);
+// ---------- 管理页面 ----------
+function buildAdminPage() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>管理员审核 - CLRA</title>
+  <style>${SHARED_STYLES}</style>
+</head>
+<body>
+<nav class="navbar">
+  <a href="/" class="brand">🌐 <span>CLRA</span></a>
+  ${navLinks('/admin')}
+</nav>
+<div class="container">
+  <div class="card">
+    <div class="card-title">🔐 管理员审核</div>
+    <div class="admin-key-area">
+      <input type="password" id="adminKeyInput" placeholder="管理密钥">
+      <button type="button" class="btn" id="adminLoginBtn">加载数据</button>
+    </div>
+    <div id="adminContent">
+      <p style="color:var(--text-secondary);">输入密钥后点击加载</p>
+    </div>
+  </div>
+</div>
+<script>
+  function escapeHtml(text) {
+    if (!text) return '';
+    var div = document.createElement('div');
+    div.appendChild(document.createTextNode(text));
+    return div.innerHTML;
   }
-
   var currentAdminKey = '';
-  async function loadAdmin() {
+  document.getElementById('adminLoginBtn').addEventListener('click', async function() {
     var keyInput = document.getElementById('adminKeyInput');
     var key = keyInput.value.trim();
     if (!key) { alert('请输入管理密钥'); return; }
@@ -888,109 +1193,188 @@ function buildAppHtml(domains, friendLinks) {
 
       var html = '';
       html += '<div class="tab-bar"><button type="button" class="tab-btn active" data-tab="pending-tab">待审核 (' + pending.length + ')</button><button type="button" class="tab-btn" data-tab="approved-tab">已审核 (' + approved.length + ')</button></div>';
-      html += '<div id="pending-tab" class="tab-content active"><h3>📋 待审核域名</h3>';
+      html += '<div id="pending-tab" class="tab-content active"><h3 style="margin:0 0 1rem 0;">📋 待审核域名</h3>';
       if (!Array.isArray(pending) || pending.length === 0) {
         html += '<p style="color:#22c55e;">✅ 暂无待审核域名</p>';
       } else {
         html += '<table><thead><tr><th>域名</th><th>提交者IP</th><th>时间</th><th>操作</th></tr></thead><tbody>';
         pending.forEach(function(item) {
           var safeDomain = escapeHtml(item.domain);
-          html += '<tr><td>' + safeDomain + '</td><td>' + escapeHtml(item.submitter) + '</td><td>' + new Date(item.time).toLocaleString() + '</td><td><button class="btn btn-success btn-sm" data-domain="' + safeDomain + '" data-action="approve" onclick="approveDomain(this.dataset.domain, this.dataset.action)">通过</button><button class="btn btn-danger btn-sm" data-domain="' + safeDomain + '" data-action="reject" onclick="approveDomain(this.dataset.domain, this.dataset.action)">拒绝</button></td></tr>';
+          html += '<tr><td>' + safeDomain + '</td><td>' + escapeHtml(item.submitter) + '</td><td>' + new Date(item.time).toLocaleString() + '</td><td><button class="btn btn-success btn-sm" data-domain="' + safeDomain + '" data-action="approve">通过</button><button class="btn btn-danger btn-sm" data-domain="' + safeDomain + '" data-action="reject">拒绝</button></td></tr>';
         });
         html += '</tbody></table>';
       }
       html += '</div>';
 
-      html += '<div id="approved-tab" class="tab-content"><h3>✅ 已审核域名</h3><div style="margin-bottom:1rem;"><button type="button" class="btn btn-danger btn-sm" onclick="batchDelete()">删除选中</button></div>';
+      html += '<div id="approved-tab" class="tab-content"><h3 style="margin:0 0 1rem 0;">✅ 已审核域名</h3><div style="margin-bottom:1rem;"><button type="button" class="btn btn-danger btn-sm" id="batchDeleteBtn">删除选中</button><span style="margin-left:1rem; font-size:0.85rem; color:var(--text-secondary);">勾选后点击删除可批量拉黑</span></div>';
       if (!Array.isArray(approved) || approved.length === 0) {
-        html += '<p>暂无已审核域名</p>';
+        html += '<p style="color:var(--text-secondary);">暂无已审核域名</p>';
       } else {
-        html += '<table><thead><tr><th><input type="checkbox" id="selectAllApproved" class="checkbox-all" onclick="toggleAll(this)"></th><th>域名</th><th>操作</th></tr></thead><tbody>';
+        html += '<table><thead><tr><th><input type="checkbox" id="selectAllApproved" class="checkbox-all"></th><th>域名</th><th>操作</th></tr></thead><tbody>';
         approved.forEach(function(domain) {
           var safeDomain = escapeHtml(domain);
-          html += '<tr><td><input type="checkbox" class="approved-checkbox" data-domain="' + safeDomain + '"></td><td>' + safeDomain + '</td><td><button class="btn btn-danger btn-xs" data-domain="' + safeDomain + '" onclick="deleteSingle(this.dataset.domain)">删除</button></td></tr>';
+          html += '<tr><td><input type="checkbox" class="approved-checkbox" data-domain="' + safeDomain + '"></td><td>' + safeDomain + '</td><td><button class="btn btn-danger btn-xs delete-approved" data-domain="' + safeDomain + '">删除</button></td></tr>';
         });
         html += '</tbody></table>';
       }
       html += '</div>';
+
       container.innerHTML = html;
 
-      // Tab 切换事件
+      // Tab 切换
       container.querySelectorAll('.tab-btn').forEach(function(btn) {
         btn.addEventListener('click', function() {
-          container.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+          container.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
           this.classList.add('active');
-          container.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-          document.getElementById(this.dataset.tab).classList.add('active');
+          var target = this.dataset.tab;
+          container.querySelectorAll('.tab-content').forEach(function(t) { t.classList.remove('active'); });
+          document.getElementById(target).classList.add('active');
         });
       });
+
+      // 待审操作
+      container.querySelectorAll('[data-action]').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+          var domain = this.dataset.domain;
+          var action = this.dataset.action;
+          if (!confirm('确定要' + (action === 'approve' ? '通过' : '拒绝') + ' ' + domain + ' 吗？')) return;
+          try {
+            var resp = await fetch('/api/admin/approve', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Admin-Key': currentAdminKey
+              },
+              body: JSON.stringify({ domain: domain, action: action })
+            });
+            var data = await resp.json();
+            if (resp.ok) {
+              alert('✅ 操作成功');
+              document.getElementById('adminLoginBtn').click();
+            } else {
+              alert('❌ 操作失败: ' + (data.error || '未知错误'));
+            }
+          } catch {
+            alert('❌ 网络错误');
+          }
+        });
+      });
+
+      // 单个删除
+      container.querySelectorAll('.delete-approved').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+          var domain = this.dataset.domain;
+          if (!confirm('确定要删除（拉黑） ' + domain + ' 吗？')) return;
+          try {
+            var resp = await fetch('/api/admin/approved', {
+              method: 'DELETE',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Admin-Key': currentAdminKey
+              },
+              body: JSON.stringify({ domain: domain })
+            });
+            var data = await resp.json();
+            if (resp.ok) {
+              alert('✅ ' + data.message);
+              document.getElementById('adminLoginBtn').click();
+            } else {
+              alert('❌ 操作失败: ' + (data.error || '未知错误'));
+            }
+          } catch {
+            alert('❌ 网络错误');
+          }
+        });
+      });
+
+      // 全选
+      var selectAll = document.getElementById('selectAllApproved');
+      if (selectAll) {
+        selectAll.addEventListener('change', function() {
+          var checkboxes = container.querySelectorAll('.approved-checkbox');
+          checkboxes.forEach(function(cb) { cb.checked = this.checked; });
+        });
+      }
+
+      // 批量删除
+      var batchBtn = document.getElementById('batchDeleteBtn');
+      if (batchBtn) {
+        batchBtn.addEventListener('click', async function() {
+          var checkboxes = container.querySelectorAll('.approved-checkbox:checked');
+          if (checkboxes.length === 0) {
+            alert('请至少选择一个域名');
+            return;
+          }
+          var domains = Array.from(checkboxes).map(function(cb) { return cb.dataset.domain; });
+          if (!confirm('确定要删除（拉黑）以下 ' + domains.length + ' 个域名吗？\n' + domains.join('、'))) return;
+          try {
+            var resp = await fetch('/api/admin/approved/batch', {
+              method: 'DELETE',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Admin-Key': currentAdminKey
+              },
+              body: JSON.stringify({ domains: domains })
+            });
+            var data = await resp.json();
+            if (resp.ok) {
+              alert('✅ ' + data.message);
+              document.getElementById('adminLoginBtn').click();
+            } else {
+              alert('❌ 操作失败: ' + (data.error || '未知错误'));
+            }
+          } catch {
+            alert('❌ 网络错误');
+          }
+        });
+      }
+
     } catch (e) {
       container.innerHTML = '<p style="color:#ef4444;">❌ 加载失败</p>';
     }
-  }
-
-  window.approveDomain = async function(domain, action) {
-    if (!confirm('确定要' + (action === 'approve' ? '通过' : '拒绝') + ' ' + domain + ' 吗？')) return;
-    try {
-      var resp = await fetch('/api/admin/approve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Admin-Key': currentAdminKey },
-        body: JSON.stringify({ domain: domain, action: action })
-      });
-      var data = await resp.json();
-      if (resp.ok) {
-        alert('✅ 操作成功');
-        loadAdmin();
-      } else {
-        alert('❌ 操作失败: ' + (data.error || '未知错误'));
-      }
-    } catch { alert('❌ 网络错误'); }
-  };
-
-  window.deleteSingle = async function(domain) {
-    if (!confirm('确定要删除（拉黑） ' + domain + ' 吗？')) return;
-    try {
-      var resp = await fetch('/api/admin/approved', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json', 'X-Admin-Key': currentAdminKey },
-        body: JSON.stringify({ domain: domain })
-      });
-      var data = await resp.json();
-      if (resp.ok) {
-        alert('✅ ' + data.message);
-        loadAdmin();
-      } else {
-        alert('❌ 操作失败: ' + (data.error || '未知错误'));
-      }
-    } catch { alert('❌ 网络错误'); }
-  };
-
-  window.batchDelete = async function() {
-    var checkboxes = document.querySelectorAll('.approved-checkbox:checked');
-    if (checkboxes.length === 0) { alert('请至少选择一个域名'); return; }
-    var domains = Array.from(checkboxes).map(cb => cb.dataset.domain);
-    if (!confirm('确定要删除（拉黑）以下 ' + domains.length + ' 个域名吗？\n' + domains.join('、'))) return;
-    try {
-      var resp = await fetch('/api/admin/approved/batch', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json', 'X-Admin-Key': currentAdminKey },
-        body: JSON.stringify({ domains: domains })
-      });
-      var data = await resp.json();
-      if (resp.ok) {
-        alert('✅ ' + data.message);
-        loadAdmin();
-      } else {
-        alert('❌ 操作失败: ' + (data.error || '未知错误'));
-      }
-    } catch { alert('❌ 网络错误'); }
-  };
-
-  function toggleAll(el) {
-    var checkboxes = document.querySelectorAll('.approved-checkbox');
-    checkboxes.forEach(cb => cb.checked = el.checked);
-  }
+  });
 </script>
+</body>
+</html>`;
+}
+
+// ---------- 友链页面 ----------
+function buildFriendsPage(friendLinks) {
+  const friendItems = (friendLinks || []).map(f => {
+    const name = escapeHtml(f.name || f.url);
+    const url = f.url;
+    let domain = url.replace(/^https?:\/\//, '').split('/')[0];
+    const viewUrl = `/view/${encodeURIComponent(domain)}/`;
+    return `
+      <div class="friend-item">
+        <a href="${viewUrl}" target="_blank" class="friend-link">
+          <span class="friend-name">${name}</span>
+          <span class="friend-domain">${escapeHtml(domain)}</span>
+        </a>
+      </div>
+    `;
+  }).join('') || '<p style="color:var(--text-secondary);">暂无友链，请在环境变量中配置 FRIEND_LINKS</p>';
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>友情链接 - CLRA</title>
+  <style>${SHARED_STYLES}</style>
+</head>
+<body>
+<nav class="navbar">
+  <a href="/" class="brand">🌐 <span>CLRA</span></a>
+  ${navLinks('/friends')}
+</nav>
+<div class="container">
+  <div class="card">
+    <div class="card-title">🔗 友情链接</div>
+    <div class="friend-grid">${friendItems}</div>
+    <div style="margin-top:1rem; font-size:0.9rem; color:var(--text-secondary);">点击友链名称将在 iframe 中代理访问</div>
+  </div>
+</div>
 </body>
 </html>`;
 }
@@ -1004,10 +1388,31 @@ export default {
     try {
       if (path === '/') {
         const domains = await getDomainList(env);
+        return new Response(buildHomePage(domains), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      }
+
+      if (path === '/submit') {
+        return new Response(buildSubmitPage(), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      }
+
+      if (path === '/admin') {
+        return new Response(buildAdminPage(), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      }
+
+      if (path === '/friends') {
         let friends = [];
-        if (env.FRIEND_LINKS) { try { friends = JSON.parse(env.FRIEND_LINKS); } catch (_) {} }
-        const html = buildAppHtml(domains, friends);
-        return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        if (env.FRIEND_LINKS) {
+          try { friends = JSON.parse(env.FRIEND_LINKS); } catch (_) {}
+        }
+        return new Response(buildFriendsPage(friends), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
       }
 
       if (path.startsWith('/view/')) {
@@ -1020,13 +1425,20 @@ export default {
         if (domain.includes('*')) {
           const random = Math.random().toString(36).substring(2, 10);
           let newDomain = domain.replace(/\*/g, random);
-          return new Response(null, { status: 302, headers: { Location: `/view/${encodeURIComponent(newDomain)}${rest}${search}${hash}` } });
+          const newViewPath = `/view/${encodeURIComponent(newDomain)}${rest}${search}${hash}`;
+          return new Response(null, { status: 302, headers: { Location: newViewPath } });
         }
-        return new Response(buildViewPage(domain, rest, search, hash), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        const html = buildViewPage(domain, rest, search, hash);
+        return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       }
 
-      if (path.startsWith('/api/')) return handleApi(request, env);
-      if (path.startsWith('/proxy/')) return handleProxy(request, env);
+      if (path.startsWith('/api/')) {
+        return handleApi(request, env);
+      }
+
+      if (path.startsWith('/proxy/')) {
+        return handleProxy(request, env);
+      }
 
       return new Response('未找到资源', { status: 404 });
     } catch (err) {
