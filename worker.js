@@ -1,5 +1,5 @@
 // ============================================================
-// CLRA Mirror - 独立页面版（导航独立 + 外部资源直连）
+// CLRA Mirror - 独立页面版（修复 admin 语法错误 + 资源直连）
 // ============================================================
 
 const CONFIG = {
@@ -712,7 +712,7 @@ async function handleApi(request, env) {
   return new Response('API 路径不存在', { status: 404 });
 }
 
-// ---------- 公共样式 / 布局 ----------
+// ---------- 共享样式 ----------
 const SHARED_STYLES = `
   :root {
     --bg: #f0f4f8;
@@ -1014,17 +1014,16 @@ const SHARED_STYLES = `
 
 function navLinks(activePath) {
   const links = [
-    { href: '/', text: '首页', page: 'home' },
-    { href: '/submit', text: '提交', page: 'submit' },
-    { href: '/admin', text: '审核', page: 'admin' },
-    { href: '/friends', text: '友链', page: 'friends' },
+    { href: '/', text: '首页' },
+    { href: '/submit', text: '提交' },
+    { href: '/admin', text: '审核' },
+    { href: '/friends', text: '友链' },
   ];
   let html = '';
   links.forEach(link => {
     const activeClass = activePath === link.href ? ' active' : '';
     html += `<a href="${link.href}" class="nav-link${activeClass}">${link.text}</a>`;
   });
-  // 浏览器入口
   html += `<a href="/view/clra1.lzh173.chat/" class="nav-link" target="_blank">浏览器</a>`;
   return html;
 }
@@ -1136,9 +1135,9 @@ function buildSubmitPage() {
 </html>`;
 }
 
-// ---------- 管理页面 ----------
+// ---------- 管理页面（彻底修复 JS 语法）----------
 function buildAdminPage() {
-  return `<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -1164,12 +1163,14 @@ function buildAdminPage() {
   </div>
 </div>
 <script>
+(function() {
   function escapeHtml(text) {
     if (!text) return '';
     var div = document.createElement('div');
     div.appendChild(document.createTextNode(text));
     return div.innerHTML;
   }
+
   var currentAdminKey = '';
   document.getElementById('adminLoginBtn').addEventListener('click', async function() {
     var keyInput = document.getElementById('adminKeyInput');
@@ -1306,7 +1307,7 @@ function buildAdminPage() {
             return;
           }
           var domains = Array.from(checkboxes).map(function(cb) { return cb.dataset.domain; });
-          if (!confirm('确定要删除（拉黑）以下 ' + domains.length + ' 个域名吗？\n' + domains.join('、'))) return;
+          if (!confirm('确定要删除（拉黑）以下 ' + domains.length + ' 个域名吗？\\n' + domains.join('、'))) return;
           try {
             var resp = await fetch('/api/admin/approved/batch', {
               method: 'DELETE',
@@ -1333,9 +1334,12 @@ function buildAdminPage() {
       container.innerHTML = '<p style="color:#ef4444;">❌ 加载失败</p>';
     }
   });
+})();
 </script>
 </body>
 </html>`;
+
+  return html;
 }
 
 // ---------- 友链页面 ----------
