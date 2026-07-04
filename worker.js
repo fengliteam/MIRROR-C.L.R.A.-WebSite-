@@ -340,16 +340,13 @@ async function handleProxy(request, env) {
             el.prepend(interceptorScript, { html: true });
           }
         })
-        // 导航类元素：使用代理重写
         .on('a', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain, false)); } })
         .on('form', { element(el) { const v = el.getAttribute('action'); if (v) el.setAttribute('action', rewriteUrl(v, domain, false)); } })
         .on('area', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain, false)); } })
-        // 资源类元素：同域代理，外域直连
         .on('img', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true)); } })
         .on('script', {
           element(el) {
             const src = el.getAttribute('src');
-            // 移除 Cloudflare 遥测脚本（可选）
             if (src && (src.includes('static.cloudflareinsights.com') || src.includes('performance.radar.cloudflare.com'))) {
               el.remove();
             } else if (src) {
@@ -386,7 +383,6 @@ async function handleProxy(request, env) {
         .on('embed', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true)); } })
         .on('object', { element(el) { const v = el.getAttribute('data'); if (v) el.setAttribute('data', rewriteUrl(v, domain, true)); } })
         .on('iframe', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true)); } })
-        // meta refresh 导航重写
         .on('meta', { element(el) {
           if (el.getAttribute('http-equiv')?.toLowerCase() === 'refresh') {
             const content = el.getAttribute('content');
@@ -398,7 +394,6 @@ async function handleProxy(request, env) {
             }
           }
         }})
-        // 内联 style 重写（资源模式）
         .on('style', { text(text) {
           const rewritten = text.text.replace(
             /url\((['"]?)([^'")]+)(['"]?)\)/g,
@@ -759,6 +754,7 @@ function buildAppHtml(domains, friendLinks) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CLRA 导航 · 镜像</title>
   <style>
+    /* 样式保持不变，已省略以便精简，实际部署请使用上方的完整样式 */
     :root {
       --bg: #f0f4f8;
       --card-bg: rgba(255, 255, 255, 0.75);
@@ -1131,13 +1127,21 @@ function buildAppHtml(domains, friendLinks) {
 </div>
 
 <script>
-  // ---------- 导航切换 ----------
-  document.querySelectorAll('.nav-link').forEach(function(btn) {
+  // 客户端 escapeHtml 函数
+  function escapeHtml(text) {
+    if (!text) return '';
+    var div = document.createElement('div');
+    div.appendChild(document.createTextNode(text));
+    return div.innerHTML;
+  }
+
+  // ---------- 导航切换（仅绑定带 data-page 的按钮）----------
+  document.querySelectorAll('.nav-link[data-page]').forEach(function(btn) {
     btn.addEventListener('click', function(e) {
       e.preventDefault();
       var page = this.getAttribute('data-page');
       if (!page) return;
-      document.querySelectorAll('.nav-link').forEach(function(b) {
+      document.querySelectorAll('.nav-link[data-page]').forEach(function(b) {
         b.classList.remove('active');
       });
       this.classList.add('active');
