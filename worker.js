@@ -1,5 +1,5 @@
 // ============================================================
-// CLRA Mirror - 最终修复版（导航修复 + 外部资源直连 + 安全加固）
+// CLRA Mirror - 最终修复版 (onclick 导航 + 外部资源直连 + 泛域名显示)
 // ============================================================
 
 const CONFIG = {
@@ -20,10 +20,7 @@ const rateMap = new Map();
 
 // ---------- 工具函数 ----------
 function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
 function escapeHtml(text) {
@@ -67,21 +64,18 @@ function isDomainAllowed(domain, allowedList) {
   return false;
 }
 
-// ---------- URL 重写（增加资源直连控制） ----------
+// ---------- URL 重写（资源直连控制） ----------
 function rewriteUrl(originalUrl, domain, isResource = false) {
   if (!originalUrl || typeof originalUrl !== 'string') return originalUrl;
-  // 特殊协议直接返回
   if (/^(data|blob|javascript|mailto|tel|ws|wss):/i.test(originalUrl)) return originalUrl;
   if (originalUrl.startsWith('/proxy/')) return originalUrl;
 
-  // 尝试解析域
   let resolvedDomain = '';
   try {
     const temp = new URL(originalUrl, `https://${domain}/`);
     resolvedDomain = temp.hostname;
   } catch (_) {}
 
-  // 资源模式：如果解析出的域名与当前代理域不同（且非相对路径），直接返回原始URL（直连）
   if (isResource && resolvedDomain && resolvedDomain.toLowerCase() !== domain.toLowerCase()) {
     return originalUrl;
   }
@@ -89,10 +83,7 @@ function rewriteUrl(originalUrl, domain, isResource = false) {
   let urlString = originalUrl;
   if (urlString.startsWith('//')) urlString = 'https:' + urlString;
 
-  let targetDomain = '',
-    path = '',
-    search = '',
-    hash = '';
+  let targetDomain = '', path = '', search = '', hash = '';
   try {
     let urlObj;
     if (urlString.startsWith('http://') || urlString.startsWith('https://')) {
@@ -193,9 +184,6 @@ async function handleProxy(request, env) {
 
   const pathMatch = url.pathname.match(/^\/proxy\/([^\/]+)(\/.*)?$/);
   if (!pathMatch) {
-    if (url.pathname === '/proxy/blocked/') {
-      return new Response('无效的链接，无法解析为目标域名', { status: 400 });
-    }
     return new Response('无效的代理路径', { status: 400 });
   }
 
@@ -239,12 +227,6 @@ async function handleProxy(request, env) {
   } catch (_) {
     return new Response('目标 URL 格式错误', { status: 400 });
   }
-  if (targetUrl.href.length > CONFIG.MAX_URL_LENGTH) {
-    return new Response(
-      `目标链接过长，请直接访问：<a href="${targetUrl.href}">${targetUrl.href}</a>`,
-      { status: 414, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
-    );
-  }
 
   const reqHeaders = new Headers(request.headers);
   ['cookie', 'authorization', 'proxy-authorization', 'x-forwarded-for', 'x-real-ip', 'cf-connecting-ip']
@@ -264,7 +246,7 @@ async function handleProxy(request, env) {
       const location = response.headers.get('Location');
       if (location) {
         const newHeaders = new Headers(response.headers);
-        newHeaders.set('Location', rewriteUrl(location, domain, false)); // 导航跳转
+        newHeaders.set('Location', rewriteUrl(location, domain, false));
         return new Response(null, { status: response.status, headers: newHeaders });
       }
     }
@@ -283,21 +265,14 @@ async function handleProxy(request, env) {
           function getProxyUrl(url) {
             if (!url || url.startsWith(proxyBase) || /^(data|blob|javascript|mailto|tel|ws|wss):/i.test(url)) return url;
             var fullUrl;
-            try {
-              fullUrl = new URL(url, window.location.origin);
-            } catch(e) {
-              return url;
-            }
+            try { fullUrl = new URL(url, window.location.origin); } catch(e) { return url; }
             if (fullUrl.pathname.startsWith(proxyBase)) return url;
             var domain = fullUrl.hostname;
             if (domain === window.location.hostname) {
               fullUrl = new URL(url, 'https://' + originalDomain + '/');
               domain = fullUrl.hostname;
             }
-            var path = fullUrl.pathname;
-            var search = fullUrl.search;
-            var hash = fullUrl.hash;
-            return proxyBase + encodeURIComponent(domain) + path + search + hash;
+            return proxyBase + encodeURIComponent(domain) + fullUrl.pathname + fullUrl.search + fullUrl.hash;
           }
           document.addEventListener('click', function(e) {
             var target = e.target.closest('a');
@@ -324,9 +299,7 @@ async function handleProxy(request, env) {
           window.open = function(url, name, features) {
             if (url) {
               var proxyUrl = getProxyUrl(url);
-              if (proxyUrl !== url) {
-                return originalOpen(proxyUrl, name, features);
-              }
+              if (proxyUrl !== url) return originalOpen(proxyUrl, name, features);
             }
             return originalOpen(url, name, features);
           };
@@ -335,25 +308,18 @@ async function handleProxy(request, env) {
       `;
 
       const rewriter = new HTMLRewriter()
-        .on('head', {
-          element(el) {
-            el.prepend(interceptorScript, { html: true });
-          }
-        })
+        .on('head', { element(el) { el.prepend(interceptorScript, { html: true }); } })
         .on('a', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain, false)); } })
         .on('form', { element(el) { const v = el.getAttribute('action'); if (v) el.setAttribute('action', rewriteUrl(v, domain, false)); } })
-        .on('area', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain, false)); } })
         .on('img', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true)); } })
-        .on('script', {
-          element(el) {
-            const src = el.getAttribute('src');
-            if (src && (src.includes('static.cloudflareinsights.com') || src.includes('performance.radar.cloudflare.com'))) {
-              el.remove();
-            } else if (src) {
-              el.setAttribute('src', rewriteUrl(src, domain, true));
-            }
+        .on('script', { element(el) {
+          const src = el.getAttribute('src');
+          if (src && (src.includes('static.cloudflareinsights.com') || src.includes('performance.radar.cloudflare.com'))) {
+            el.remove();
+          } else if (src) {
+            el.setAttribute('src', rewriteUrl(src, domain, true));
           }
-        })
+        }})
         .on('link', { element(el) {
           const rel = el.getAttribute('rel');
           if (['stylesheet', 'preload', 'preconnect', 'dns-prefetch', 'icon', 'apple-touch-icon'].includes(rel)) {
@@ -362,17 +328,13 @@ async function handleProxy(request, env) {
           }
         }})
         .on('source', { element(el) {
-          const v = el.getAttribute('src');
-          if (v) el.setAttribute('src', rewriteUrl(v, domain, true));
+          const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true));
           const srcset = el.getAttribute('srcset');
           if (srcset) {
             const newSrcset = srcset.split(',').map(part => {
               const trimmed = part.trim();
               const parts = trimmed.split(/\s+/);
-              if (parts.length > 0) {
-                parts[0] = rewriteUrl(parts[0], domain, true);
-                return parts.join(' ');
-              }
+              if (parts.length > 0) { parts[0] = rewriteUrl(parts[0], domain, true); return parts.join(' '); }
               return trimmed;
             }).join(', ');
             el.setAttribute('srcset', newSrcset);
@@ -388,23 +350,17 @@ async function handleProxy(request, env) {
             const content = el.getAttribute('content');
             if (content) {
               const match = content.match(/url=(.+)/i);
-              if (match) {
-                el.setAttribute('content', content.replace(/url=.+/i, `url=${rewriteUrl(match[1], domain, false)}`));
-              }
+              if (match) el.setAttribute('content', content.replace(/url=.+/i, `url=${rewriteUrl(match[1], domain, false)}`));
             }
           }
         }})
         .on('style', { text(text) {
-          const rewritten = text.text.replace(
-            /url\((['"]?)([^'")]+)(['"]?)\)/g,
-            (_, q1, urlPart, q2) => `url(${q1}${rewriteUrl(urlPart.trim(), domain, true)}${q2})`
-          );
+          const rewritten = text.text.replace(/url\((['"]?)([^'")]+)(['"]?)\)/g,
+            (_, q1, urlPart, q2) => `url(${q1}${rewriteUrl(urlPart.trim(), domain, true)}${q2})`);
           text.replace(rewritten);
         }});
 
-      return rewriter.transform(
-        new Response(response.body, { status: response.status, headers: respHeaders })
-      );
+      return rewriter.transform(new Response(response.body, { status: response.status, headers: respHeaders }));
     }
 
     if (contentType.includes('text/css')) {
@@ -439,152 +395,35 @@ function buildViewPage(domain, path, search, hash) {
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; background: #1e293b; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-    #toolbar {
-      background: #0f172a;
-      color: #f1f5f9;
-      padding: 8px 12px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-      border-bottom: 1px solid #334155;
-      flex-shrink: 0;
-    }
-    #toolbar button {
-      background: #334155;
-      border: none;
-      color: #f1f5f9;
-      width: 32px;
-      height: 32px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 16px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: 0.2s;
-    }
+    #toolbar { background: #0f172a; color: #f1f5f9; padding: 8px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-bottom: 1px solid #334155; flex-shrink: 0; }
+    #toolbar button { background: #334155; border: none; color: #f1f5f9; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: 0.2s; }
     #toolbar button:hover { background: #475569; }
-    #toolbar button:active { transform: scale(0.95); }
-    #address-bar {
-      flex: 1;
-      min-width: 200px;
-      padding: 6px 12px;
-      border-radius: 20px;
-      border: 1px solid #475569;
-      background: #1e293b;
-      color: #f1f5f9;
-      font-size: 14px;
-      outline: none;
-    }
+    #address-bar { flex: 1; min-width: 200px; padding: 6px 12px; border-radius: 20px; border: 1px solid #475569; background: #1e293b; color: #f1f5f9; font-size: 14px; outline: none; }
     #address-bar:focus { border-color: #60a5fa; }
-    #iframe-container {
-      flex: 1;
-      background: #0f172a;
-    }
-    iframe {
-      width: 100%;
-      height: 100%;
-      border: none;
-      background: #fff;
-    }
-    .status-text {
-      color: #94a3b8;
-      font-size: 12px;
-      margin-left: 8px;
-    }
+    #iframe-container { flex: 1; background: #0f172a; }
+    iframe { width: 100%; height: 100%; border: none; background: #fff; }
+    .status-text { color: #94a3b8; font-size: 12px; margin-left: 8px; }
     @media (max-width: 640px) {
-      #toolbar { padding: 4px 8px; gap: 4px; }
-      #address-bar { font-size: 12px; padding: 4px 8px; }
       #toolbar button { width: 28px; height: 28px; font-size: 14px; }
     }
   </style>
 </head>
 <body>
   <div id="toolbar">
-    <button id="backBtn" title="后退">←</button>
-    <button id="forwardBtn" title="前进">→</button>
-    <button id="refreshBtn" title="刷新">⟳</button>
-    <input type="text" id="address-bar" value="${escapeHtml(displayUrl)}" spellcheck="false" />
+    <button id="backBtn" title="后退" onclick="try{iframe.contentWindow.history.back()}catch(e){}">←</button>
+    <button id="forwardBtn" title="前进" onclick="try{iframe.contentWindow.history.forward()}catch(e){}">→</button>
+    <button id="refreshBtn" title="刷新" onclick="try{iframe.contentWindow.location.reload()}catch(e){}">⟳</button>
+    <input type="text" id="address-bar" value="${escapeHtml(displayUrl)}" spellcheck="false" onkeydown="if(event.key==='Enter'){let i=this.value.trim();if(!i)return;if(!i.startsWith('http'))i='https://'+i;try{let u=new URL(i);location.href='/view/'+encodeURIComponent(u.hostname)+u.pathname+u.search+u.hash}catch(e){alert('无效URL')}}" />
     <span class="status-text" id="statusText">就绪</span>
   </div>
   <div id="iframe-container">
-    <iframe id="proxyFrame" src="${escapeHtml(proxySrc)}"></iframe>
+    <iframe id="proxyFrame" src="${escapeHtml(proxySrc)}" onload="try{let f=document.getElementById('proxyFrame');let u=f.contentWindow.location;let m=u.pathname+u.search+u.hash;let r=m.match(/^\/proxy\/([^\/]+)(\/.*)?$/);if(r){document.getElementById('address-bar').value='https://'+r[1]+(r[2]||'/');document.getElementById('statusText').textContent='加载完成'}}catch(e){}" onerror="document.getElementById('statusText').textContent='加载失败'"></iframe>
   </div>
-
-  <script>
-    (function() {
-      var iframe = document.getElementById('proxyFrame');
-      var addressBar = document.getElementById('address-bar');
-      var statusText = document.getElementById('statusText');
-      var backBtn = document.getElementById('backBtn');
-      var forwardBtn = document.getElementById('forwardBtn');
-      var refreshBtn = document.getElementById('refreshBtn');
-
-      function updateAddress() {
-        try {
-          var frameUrl = iframe.contentWindow.location.href;
-          if (frameUrl) {
-            var urlObj = new URL(frameUrl);
-            var path = urlObj.pathname + urlObj.search + urlObj.hash;
-            var match = path.match(/^\/proxy\/([^\/]+)(\/.*)?$/);
-            if (match) {
-              var domain = match[1];
-              var rest = match[2] || '/';
-              addressBar.value = 'https://' + domain + rest;
-              statusText.textContent = '加载完成';
-            } else {
-              addressBar.value = frameUrl;
-            }
-          }
-        } catch(e) {}
-      }
-
-      iframe.addEventListener('load', function() {
-        setTimeout(updateAddress, 100);
-        statusText.textContent = '加载中...';
-      });
-
-      addressBar.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter') {
-          var input = addressBar.value.trim();
-          if (!input) return;
-          if (!input.startsWith('http://') && !input.startsWith('https://')) {
-            input = 'https://' + input;
-          }
-          try {
-            var urlObj = new URL(input);
-            var domain = urlObj.hostname;
-            var path = urlObj.pathname + urlObj.search + urlObj.hash;
-            var viewPath = '/view/' + encodeURIComponent(domain) + path;
-            window.location.href = viewPath;
-          } catch(e) {
-            alert('无效的 URL');
-          }
-        }
-      });
-
-      backBtn.addEventListener('click', function() {
-        try { iframe.contentWindow.history.back(); } catch(e) {}
-      });
-      forwardBtn.addEventListener('click', function() {
-        try { iframe.contentWindow.history.forward(); } catch(e) {}
-      });
-      refreshBtn.addEventListener('click', function() {
-        try { iframe.contentWindow.location.reload(); } catch(e) {}
-      });
-
-      iframe.addEventListener('error', function() {
-        statusText.textContent = '加载失败';
-      });
-      setTimeout(updateAddress, 300);
-    })();
-  </script>
 </body>
 </html>`;
 }
 
-// ---------- API 处理 ----------
+// ---------- API 处理 (不变，省略重复部分) ----------
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const method = request.method;
@@ -597,48 +436,29 @@ async function handleApi(request, env) {
   if (method === 'POST' && path === '/api/domains') {
     try {
       const { domain } = await request.json();
-      if (!domain || !/^[a-z0-9.*-]+$/i.test(domain)) {
-        return jsonResponse({ error: '域名格式无效' }, 400);
-      }
+      if (!domain || !/^[a-z0-9.*-]+$/i.test(domain)) return jsonResponse({ error: '域名格式无效' }, 400);
       const pending = await env.DOMAINS_KV.get('pending_list', 'json') || [];
       const approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
-      if (pending.some(item => item.domain === domain) || approved.includes(domain)) {
-        return jsonResponse({ error: '该域名已提交或已通过审核' }, 409);
-      }
+      if (pending.some(item => item.domain === domain) || approved.includes(domain)) return jsonResponse({ error: '该域名已提交或已通过审核' }, 409);
       const submitter = request.headers.get('CF-Connecting-IP') || 'unknown';
-      pending.push({
-        id: crypto.randomUUID(),
-        domain,
-        submitter,
-        time: Date.now(),
-      });
+      pending.push({ id: crypto.randomUUID(), domain, submitter, time: Date.now() });
       await env.DOMAINS_KV.put('pending_list', JSON.stringify(pending));
       return jsonResponse({ success: true, message: '提交成功，等待管理员审核' }, 201);
-    } catch (_) {
-      return jsonResponse({ error: '请求体格式错误' }, 400);
-    }
+    } catch (_) { return jsonResponse({ error: '请求体格式错误' }, 400); }
   }
 
   if (method === 'GET' && path === '/api/admin/pending') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
-    try {
-      const pending = await env.DOMAINS_KV.get('pending_list', 'json') || [];
-      return jsonResponse(pending);
-    } catch (_) {
-      return jsonResponse({ error: '服务器读取失败' }, 500);
-    }
+    const pending = await env.DOMAINS_KV.get('pending_list', 'json') || [];
+    return jsonResponse(pending);
   }
 
   if (method === 'GET' && path === '/api/admin/approved') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
-    try {
-      const approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
-      return jsonResponse(approved);
-    } catch (_) {
-      return jsonResponse({ error: '服务器读取失败' }, 500);
-    }
+    const approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
+    return jsonResponse(approved);
   }
 
   if (method === 'POST' && path === '/api/admin/approve') {
@@ -646,14 +466,10 @@ async function handleApi(request, env) {
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
     try {
       const { domain, action } = await request.json();
-      if (!domain || !['approve', 'reject'].includes(action)) {
-        return jsonResponse({ error: '参数无效' }, 400);
-      }
+      if (!domain || !['approve', 'reject'].includes(action)) return jsonResponse({ error: '参数无效' }, 400);
       let pending = await env.DOMAINS_KV.get('pending_list', 'json') || [];
       const index = pending.findIndex(item => item.domain === domain);
-      if (index === -1) {
-        return jsonResponse({ error: '未找到该待审域名' }, 404);
-      }
+      if (index === -1) return jsonResponse({ error: '未找到该待审域名' }, 404);
       pending.splice(index, 1);
       await env.DOMAINS_KV.put('pending_list', JSON.stringify(pending));
       if (action === 'approve') {
@@ -664,65 +480,46 @@ async function handleApi(request, env) {
         }
       }
       return jsonResponse({ success: true });
-    } catch (_) {
-      return jsonResponse({ error: '请求处理异常' }, 400);
-    }
+    } catch (_) { return jsonResponse({ error: '请求处理异常' }, 400); }
   }
 
   if (method === 'DELETE' && path === '/api/admin/approved') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
-    try {
-      const { domain } = await request.json();
-      if (!domain) return jsonResponse({ error: '缺少域名参数' }, 400);
-      let approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
-      const index = approved.indexOf(domain);
-      if (index === -1) {
-        return jsonResponse({ error: '该域名不在已审核列表中' }, 404);
-      }
-      approved.splice(index, 1);
-      await env.DOMAINS_KV.put('approved_list', JSON.stringify(approved));
-      return jsonResponse({ success: true, message: '已从白名单移除' });
-    } catch (_) {
-      return jsonResponse({ error: '请求处理异常' }, 400);
-    }
+    const { domain } = await request.json();
+    if (!domain) return jsonResponse({ error: '缺少域名参数' }, 400);
+    let approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
+    const index = approved.indexOf(domain);
+    if (index === -1) return jsonResponse({ error: '该域名不在已审核列表中' }, 404);
+    approved.splice(index, 1);
+    await env.DOMAINS_KV.put('approved_list', JSON.stringify(approved));
+    return jsonResponse({ success: true, message: '已从白名单移除' });
   }
 
   if (method === 'DELETE' && path === '/api/admin/approved/batch') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
-    try {
-      const { domains } = await request.json();
-      if (!Array.isArray(domains) || domains.length === 0) {
-        return jsonResponse({ error: '请提供要删除的域名列表' }, 400);
-      }
-      let approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
-      const toRemove = new Set(domains);
-      const newApproved = approved.filter(d => !toRemove.has(d));
-      await env.DOMAINS_KV.put('approved_list', JSON.stringify(newApproved));
-      return jsonResponse({ success: true, message: `成功移除 ${approved.length - newApproved.length} 个域名` });
-    } catch (_) {
-      return jsonResponse({ error: '请求处理异常' }, 400);
-    }
+    const { domains } = await request.json();
+    if (!Array.isArray(domains) || domains.length === 0) return jsonResponse({ error: '请提供要删除的域名列表' }, 400);
+    let approved = await env.DOMAINS_KV.get('approved_list', 'json') || [];
+    const toRemove = new Set(domains);
+    const newApproved = approved.filter(d => !toRemove.has(d));
+    await env.DOMAINS_KV.put('approved_list', JSON.stringify(newApproved));
+    return jsonResponse({ success: true, message: `成功移除 ${approved.length - newApproved.length} 个域名` });
   }
 
   if (method === 'GET' && path === '/api/friends') {
-    try {
-      const friends = env.FRIEND_LINKS ? JSON.parse(env.FRIEND_LINKS) : [];
-      return jsonResponse(friends);
-    } catch (_) {
-      return jsonResponse([]);
-    }
+    try { const friends = env.FRIEND_LINKS ? JSON.parse(env.FRIEND_LINKS) : []; return jsonResponse(friends); }
+    catch (_) { return jsonResponse([]); }
   }
 
   return new Response('API 路径不存在', { status: 404 });
 }
 
-// ---------- 构建管理界面 HTML（泛域名显示为随机子域名）----------
+// ---------- 构建首页 HTML（onclick 导航，各卡片独立） ----------
 function buildAppHtml(domains, friendLinks) {
   const domainItems = domains.map(d => {
     if (d.startsWith('*.')) {
-      // 泛域名显示为随机子域名，无“随机”标签
       const base = d.slice(2);
       const random = Math.random().toString(36).substring(2, 10);
       const display = random + '.' + base;
@@ -754,7 +551,6 @@ function buildAppHtml(domains, friendLinks) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CLRA 导航 · 镜像</title>
   <style>
-    /* 样式保持不变，已省略以便精简，实际部署请使用上方的完整样式 */
     :root {
       --bg: #f0f4f8;
       --card-bg: rgba(255, 255, 255, 0.75);
@@ -769,8 +565,6 @@ function buildAppHtml(domains, friendLinks) {
       --input-border: #e2e8f0;
       --tag-bg: rgba(37, 99, 235, 0.08);
       --tag-border: rgba(37, 99, 235, 0.15);
-      --badge-bg: #2563eb;
-      --badge-text: #fff;
       --transition: 0.25s;
     }
     @media (prefers-color-scheme: dark) {
@@ -788,8 +582,6 @@ function buildAppHtml(domains, friendLinks) {
         --input-border: #334155;
         --tag-bg: rgba(96, 165, 250, 0.12);
         --tag-border: rgba(96, 165, 250, 0.2);
-        --badge-bg: #60a5fa;
-        --badge-text: #0f172a;
       }
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -798,16 +590,13 @@ function buildAppHtml(domains, friendLinks) {
       background: var(--bg);
       color: var(--text);
       min-height: 100vh;
-      transition: background 0.3s, color 0.3s;
       padding-top: 70px;
       background-image: radial-gradient(circle at 10% 30%, rgba(37,99,235,0.05) 0%, transparent 60%),
                         radial-gradient(circle at 90% 70%, rgba(96,165,250,0.05) 0%, transparent 60%);
     }
     .navbar {
       position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
+      top: 0; left: 0; right: 0;
       z-index: 1000;
       background: var(--nav-bg);
       backdrop-filter: blur(20px);
@@ -818,7 +607,6 @@ function buildAppHtml(domains, friendLinks) {
       padding: 0 2rem;
       height: 64px;
       gap: 1.5rem;
-      flex-wrap: nowrap;
       overflow-x: auto;
       box-shadow: 0 2px 20px rgba(0,0,0,0.06);
     }
@@ -846,15 +634,8 @@ function buildAppHtml(domains, friendLinks) {
       font-size: 0.95rem;
     }
     .nav-link:hover { background: var(--tag-bg); color: var(--text); }
-    .nav-link.active {
-      background: var(--link-color);
-      color: white;
-    }
-    .container {
-      max-width: 1100px;
-      margin: 0 auto;
-      padding: 1.5rem 1.5rem 3rem;
-    }
+    .nav-link.active { background: var(--link-color); color: white; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 1.5rem 1.5rem 3rem; }
     .card {
       background: var(--card-bg);
       backdrop-filter: blur(16px);
@@ -866,14 +647,7 @@ function buildAppHtml(domains, friendLinks) {
       margin-bottom: 2rem;
       transition: var(--transition);
     }
-    .card-title {
-      font-size: 1.6rem;
-      font-weight: 600;
-      margin-bottom: 1.2rem;
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-    }
+    .card-title { font-size: 1.6rem; font-weight: 600; margin-bottom: 1.2rem; display: flex; align-items: center; gap: 0.6rem; }
     .search-box {
       width: 100%;
       padding: 0.9rem 1.4rem;
@@ -886,10 +660,7 @@ function buildAppHtml(domains, friendLinks) {
       transition: var(--transition);
       margin-bottom: 1.5rem;
     }
-    .search-box:focus {
-      border-color: var(--link-color);
-      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
-    }
+    .search-box:focus { border-color: var(--link-color); box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12); }
     .domain-grid {
       display: flex;
       flex-wrap: wrap;
@@ -910,19 +681,9 @@ function buildAppHtml(domains, friendLinks) {
       display: inline-flex;
       align-items: center;
       gap: 0.3rem;
-      cursor: pointer;
     }
-    .domain-link:hover {
-      background: var(--link-color);
-      color: white;
-      transform: scale(1.04);
-      border-color: var(--link-color);
-    }
-    .friend-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-      gap: 1.2rem;
-    }
+    .domain-link:hover { background: var(--link-color); color: white; transform: scale(1.04); border-color: var(--link-color); }
+    .friend-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1.2rem; }
     .friend-item {
       background: var(--tag-bg);
       border: 1px solid var(--tag-border);
@@ -930,122 +691,43 @@ function buildAppHtml(domains, friendLinks) {
       padding: 1rem 1.2rem;
       transition: var(--transition);
     }
-    .friend-item:hover {
-      background: var(--link-color);
-      border-color: var(--link-color);
-      transform: translateY(-2px);
-      box-shadow: 0 8px 20px rgba(37,99,235,0.15);
-    }
+    .friend-item:hover { background: var(--link-color); border-color: var(--link-color); transform: translateY(-2px); box-shadow: 0 8px 20px rgba(37,99,235,0.15); }
     .friend-item:hover .friend-name,
     .friend-item:hover .friend-domain { color: white; }
-    .friend-link {
-      text-decoration: none;
-      display: flex;
-      flex-direction: column;
-      gap: 0.2rem;
-    }
+    .friend-link { text-decoration: none; display: flex; flex-direction: column; gap: 0.2rem; }
     .friend-name { font-weight: 600; color: var(--text); font-size: 1.1rem; }
     .friend-domain { font-size: 0.85rem; color: var(--text-secondary); opacity: 0.7; }
-    .admin-key-area {
-      display: flex;
-      gap: 0.8rem;
-      flex-wrap: wrap;
-      align-items: center;
-      margin-bottom: 1.5rem;
-    }
+    .admin-key-area { display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: center; margin-bottom: 1.5rem; }
     .admin-key-area input {
-      flex: 1;
-      min-width: 200px;
-      padding: 0.8rem 1.2rem;
-      border-radius: 60px;
-      border: 1px solid var(--input-border);
-      background: var(--input-bg);
-      color: var(--text);
-      outline: none;
-      transition: var(--transition);
+      flex: 1; min-width: 200px; padding: 0.8rem 1.2rem; border-radius: 60px;
+      border: 1px solid var(--input-border); background: var(--input-bg); color: var(--text); outline: none; transition: var(--transition);
     }
-    .admin-key-area input:focus {
-      border-color: var(--link-color);
-      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
-    }
+    .admin-key-area input:focus { border-color: var(--link-color); box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12); }
     .btn {
-      padding: 0.8rem 2rem;
-      border: none;
-      border-radius: 60px;
-      font-weight: 600;
-      background: var(--link-color);
-      color: white;
-      cursor: pointer;
-      transition: var(--transition);
-      white-space: nowrap;
-      font-size: 0.95rem;
+      padding: 0.8rem 2rem; border: none; border-radius: 60px; font-weight: 600;
+      background: var(--link-color); color: white; cursor: pointer; transition: var(--transition);
+      white-space: nowrap; font-size: 0.95rem;
     }
     .btn:hover { background: var(--link-hover); transform: scale(1.02); }
-    .btn-outline {
-      background: transparent;
-      border: 1px solid var(--input-border);
-      color: var(--text);
-    }
-    .btn-outline:hover { background: var(--tag-bg); }
-    .btn-success { background: #16a34a; }
-    .btn-success:hover { background: #15803d; }
-    .btn-danger { background: #dc2626; }
-    .btn-danger:hover { background: #b91c1c; }
+    .btn-success { background: #16a34a; } .btn-success:hover { background: #15803d; }
+    .btn-danger { background: #dc2626; } .btn-danger:hover { background: #b91c1c; }
     .btn-sm { padding: 0.3rem 1rem; font-size: 0.8rem; }
     .btn-xs { padding: 0.2rem 0.7rem; font-size: 0.7rem; }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.9rem;
-    }
-    th {
-      text-align: left;
-      padding: 0.7rem 0.5rem;
-      color: var(--text-secondary);
-      border-bottom: 2px solid var(--input-border);
-    }
-    td {
-      padding: 0.7rem 0.5rem;
-      border-bottom: 1px solid var(--input-border);
-    }
-    .action-btns {
-      display: flex;
-      gap: 0.4rem;
-      flex-wrap: wrap;
-    }
-    .msg {
-      padding: 0.5rem 1rem;
-      border-radius: 60px;
-      margin-top: 0.8rem;
-      display: none;
-    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th { text-align: left; padding: 0.7rem 0.5rem; color: var(--text-secondary); border-bottom: 2px solid var(--input-border); }
+    td { padding: 0.7rem 0.5rem; border-bottom: 1px solid var(--input-border); }
+    .msg { padding: 0.5rem 1rem; border-radius: 60px; margin-top: 0.8rem; display: none; }
     .msg-success { background: #dcfce7; color: #166534; }
     .msg-error { background: #fee2e2; color: #991b1b; }
     .page { display: none; animation: fadeIn 0.3s ease; }
     .page.active { display: block; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-    .sub-section { margin-top: 2rem; border-top: 1px solid var(--border); padding-top: 1.5rem; }
-    .tab-bar {
-      display: flex;
-      gap: 0.5rem;
-      margin-bottom: 1.5rem;
-      border-bottom: 2px solid var(--input-border);
-      padding-bottom: 0.5rem;
-    }
+    .tab-bar { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; border-bottom: 2px solid var(--input-border); padding-bottom: 0.5rem; }
     .tab-btn {
-      background: transparent;
-      border: none;
-      padding: 0.5rem 1.2rem;
-      border-radius: 30px;
-      font-weight: 500;
-      color: var(--text-secondary);
-      cursor: pointer;
-      transition: var(--transition);
+      background: transparent; border: none; padding: 0.5rem 1.2rem; border-radius: 30px;
+      font-weight: 500; color: var(--text-secondary); cursor: pointer; transition: var(--transition);
     }
-    .tab-btn.active {
-      background: var(--link-color);
-      color: white;
-    }
+    .tab-btn.active { background: var(--link-color); color: white; }
     .tab-btn:hover:not(.active) { background: var(--tag-bg); }
     .tab-content { display: none; }
     .tab-content.active { display: block; }
@@ -1056,8 +738,6 @@ function buildAppHtml(domains, friendLinks) {
       .nav-link { font-size: 0.85rem; padding: 0.3rem 0.6rem; }
       .container { padding: 1rem; }
       .card { padding: 1.2rem; }
-      .friend-grid { grid-template-columns: 1fr 1fr; }
-      .admin-key-area { flex-direction: column; }
     }
   </style>
 </head>
@@ -1065,10 +745,10 @@ function buildAppHtml(domains, friendLinks) {
 
 <nav class="navbar">
   <a href="/" class="brand">🌐 <span>CLRA</span></a>
-  <button type="button" class="nav-link active" data-page="home">首页</button>
-  <button type="button" class="nav-link" data-page="submit">提交</button>
-  <button type="button" class="nav-link" data-page="admin">审核</button>
-  <button type="button" class="nav-link" data-page="friends">友链</button>
+  <button type="button" class="nav-link active" data-page="home" onclick="switchPage('home')">首页</button>
+  <button type="button" class="nav-link" data-page="submit" onclick="switchPage('submit')">提交</button>
+  <button type="button" class="nav-link" data-page="admin" onclick="switchPage('admin')">审核</button>
+  <button type="button" class="nav-link" data-page="friends" onclick="switchPage('friends')">友链</button>
   <a href="/view/clra1.lzh173.chat/" class="nav-link" target="_blank">浏览器</a>
 </nav>
 
@@ -1093,7 +773,7 @@ function buildAppHtml(domains, friendLinks) {
       <p style="color:var(--text-secondary); margin-bottom:1.2rem;">支持泛域名，如 <code>*.example.com</code></p>
       <div style="display:flex; gap:0.8rem; flex-wrap:wrap;">
         <input type="text" id="submitDomainInput" class="search-box" style="flex:1; min-width:200px;" placeholder="example.com 或 *.example.com">
-        <button type="button" class="btn" id="submitBtn">提交审核</button>
+        <button type="button" class="btn" id="submitBtn" onclick="submitDomain()">提交审核</button>
       </div>
       <div id="submitMsg" class="msg"></div>
     </div>
@@ -1104,7 +784,7 @@ function buildAppHtml(domains, friendLinks) {
       <div class="card-title">🔐 管理员审核</div>
       <div class="admin-key-area">
         <input type="password" id="adminKeyInput" placeholder="管理密钥">
-        <button type="button" class="btn" id="adminLoginBtn">加载数据</button>
+        <button type="button" class="btn" id="adminLoginBtn" onclick="loadAdmin()">加载数据</button>
       </div>
       <div id="adminContent">
         <p style="color:var(--text-secondary);">输入密钥后点击加载</p>
@@ -1118,16 +798,13 @@ function buildAppHtml(domains, friendLinks) {
       <div class="friend-grid">
         ${friendItems || '<p style="color:var(--text-secondary);">暂无友链，请在环境变量中配置 FRIEND_LINKS</p>'}
       </div>
-      <div style="margin-top:1rem; font-size:0.9rem; color:var(--text-secondary);">
-        点击友链名称将在 iframe 中代理访问
-      </div>
     </div>
   </div>
 
 </div>
 
 <script>
-  // 客户端 escapeHtml 函数
+  // 客户端 escapeHtml
   function escapeHtml(text) {
     if (!text) return '';
     var div = document.createElement('div');
@@ -1135,23 +812,19 @@ function buildAppHtml(domains, friendLinks) {
     return div.innerHTML;
   }
 
-  // ---------- 导航切换（仅绑定带 data-page 的按钮）----------
-  document.querySelectorAll('.nav-link[data-page]').forEach(function(btn) {
-    btn.addEventListener('click', function(e) {
-      e.preventDefault();
-      var page = this.getAttribute('data-page');
-      if (!page) return;
-      document.querySelectorAll('.nav-link[data-page]').forEach(function(b) {
-        b.classList.remove('active');
-      });
-      this.classList.add('active');
-      document.querySelectorAll('.page').forEach(function(p) {
-        p.classList.remove('active');
-      });
-      var target = document.getElementById('page-' + page);
-      if (target) target.classList.add('active');
+  // 导航切换
+  function switchPage(page) {
+    document.querySelectorAll('.nav-link[data-page]').forEach(function(b) {
+      b.classList.remove('active');
     });
-  });
+    var btn = document.querySelector('.nav-link[data-page="' + page + '"]');
+    if (btn) btn.classList.add('active');
+    document.querySelectorAll('.page').forEach(function(p) {
+      p.classList.remove('active');
+    });
+    var target = document.getElementById('page-' + page);
+    if (target) target.classList.add('active');
+  }
 
   function filterDomains() {
     var q = document.getElementById('searchInput').value.toLowerCase().trim();
@@ -1161,10 +834,8 @@ function buildAppHtml(domains, friendLinks) {
       link.style.display = text.includes(q) ? 'inline-flex' : 'none';
     });
   }
-  window.filterDomains = filterDomains;
 
-  // ---------- 提交域名 ----------
-  document.getElementById('submitBtn').addEventListener('click', async function() {
+  async function submitDomain() {
     var input = document.getElementById('submitDomainInput');
     var domain = input.value.trim();
     var msg = document.getElementById('submitMsg');
@@ -1185,7 +856,7 @@ function buildAppHtml(domains, friendLinks) {
     } catch {
       showMsg(msg, '❌ 网络错误', 'error');
     }
-  });
+  }
 
   function showMsg(el, text, type) {
     el.textContent = text;
@@ -1194,9 +865,8 @@ function buildAppHtml(domains, friendLinks) {
     setTimeout(function() { el.style.display = 'none'; }, 5000);
   }
 
-  // ---------- 管理员（带 XSS 转义）----------
   var currentAdminKey = '';
-  document.getElementById('adminLoginBtn').addEventListener('click', async function() {
+  async function loadAdmin() {
     var keyInput = document.getElementById('adminKeyInput');
     var key = keyInput.value.trim();
     if (!key) { alert('请输入管理密钥'); return; }
@@ -1218,146 +888,108 @@ function buildAppHtml(domains, friendLinks) {
 
       var html = '';
       html += '<div class="tab-bar"><button type="button" class="tab-btn active" data-tab="pending-tab">待审核 (' + pending.length + ')</button><button type="button" class="tab-btn" data-tab="approved-tab">已审核 (' + approved.length + ')</button></div>';
-      html += '<div id="pending-tab" class="tab-content active"><h3 style="margin:0 0 1rem 0;">📋 待审核域名</h3>';
+      html += '<div id="pending-tab" class="tab-content active"><h3>📋 待审核域名</h3>';
       if (!Array.isArray(pending) || pending.length === 0) {
         html += '<p style="color:#22c55e;">✅ 暂无待审核域名</p>';
       } else {
         html += '<table><thead><tr><th>域名</th><th>提交者IP</th><th>时间</th><th>操作</th></tr></thead><tbody>';
         pending.forEach(function(item) {
           var safeDomain = escapeHtml(item.domain);
-          html += '<tr><td>' + safeDomain + '</td><td>' + escapeHtml(item.submitter) + '</td><td>' + new Date(item.time).toLocaleString() + '</td><td><button class="btn btn-success btn-sm" data-domain="' + safeDomain + '" data-action="approve">通过</button><button class="btn btn-danger btn-sm" data-domain="' + safeDomain + '" data-action="reject">拒绝</button></td></tr>';
+          html += '<tr><td>' + safeDomain + '</td><td>' + escapeHtml(item.submitter) + '</td><td>' + new Date(item.time).toLocaleString() + '</td><td><button class="btn btn-success btn-sm" data-domain="' + safeDomain + '" data-action="approve" onclick="approveDomain(this.dataset.domain, this.dataset.action)">通过</button><button class="btn btn-danger btn-sm" data-domain="' + safeDomain + '" data-action="reject" onclick="approveDomain(this.dataset.domain, this.dataset.action)">拒绝</button></td></tr>';
         });
         html += '</tbody></table>';
       }
       html += '</div>';
 
-      html += '<div id="approved-tab" class="tab-content"><h3 style="margin:0 0 1rem 0;">✅ 已审核域名</h3><div style="margin-bottom:1rem;"><button type="button" class="btn btn-danger btn-sm" id="batchDeleteBtn">删除选中</button><span style="margin-left:1rem; font-size:0.85rem; color:var(--text-secondary);">勾选后点击删除可批量拉黑</span></div>';
+      html += '<div id="approved-tab" class="tab-content"><h3>✅ 已审核域名</h3><div style="margin-bottom:1rem;"><button type="button" class="btn btn-danger btn-sm" onclick="batchDelete()">删除选中</button></div>';
       if (!Array.isArray(approved) || approved.length === 0) {
-        html += '<p style="color:var(--text-secondary);">暂无已审核域名</p>';
+        html += '<p>暂无已审核域名</p>';
       } else {
-        html += '<table><thead><tr><th><input type="checkbox" id="selectAllApproved" class="checkbox-all"></th><th>域名</th><th>操作</th></tr></thead><tbody>';
+        html += '<table><thead><tr><th><input type="checkbox" id="selectAllApproved" class="checkbox-all" onclick="toggleAll(this)"></th><th>域名</th><th>操作</th></tr></thead><tbody>';
         approved.forEach(function(domain) {
           var safeDomain = escapeHtml(domain);
-          html += '<tr><td><input type="checkbox" class="approved-checkbox" data-domain="' + safeDomain + '"></td><td>' + safeDomain + '</td><td><button class="btn btn-danger btn-xs delete-approved" data-domain="' + safeDomain + '">删除</button></td></tr>';
+          html += '<tr><td><input type="checkbox" class="approved-checkbox" data-domain="' + safeDomain + '"></td><td>' + safeDomain + '</td><td><button class="btn btn-danger btn-xs" data-domain="' + safeDomain + '" onclick="deleteSingle(this.dataset.domain)">删除</button></td></tr>';
         });
         html += '</tbody></table>';
       }
       html += '</div>';
-
       container.innerHTML = html;
 
-      // Tab 切换
+      // Tab 切换事件
       container.querySelectorAll('.tab-btn').forEach(function(btn) {
         btn.addEventListener('click', function() {
-          container.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+          container.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
           this.classList.add('active');
-          var target = this.dataset.tab;
-          container.querySelectorAll('.tab-content').forEach(function(t) { t.classList.remove('active'); });
-          document.getElementById(target).classList.add('active');
+          container.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+          document.getElementById(this.dataset.tab).classList.add('active');
         });
       });
-
-      // 待审操作
-      container.querySelectorAll('[data-action]').forEach(function(btn) {
-        btn.addEventListener('click', async function() {
-          var domain = this.dataset.domain;
-          var action = this.dataset.action;
-          if (!confirm('确定要' + (action === 'approve' ? '通过' : '拒绝') + ' ' + domain + ' 吗？')) return;
-          try {
-            var resp = await fetch('/api/admin/approve', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Admin-Key': currentAdminKey
-              },
-              body: JSON.stringify({ domain: domain, action: action })
-            });
-            var data = await resp.json();
-            if (resp.ok) {
-              alert('✅ 操作成功');
-              document.getElementById('adminLoginBtn').click();
-            } else {
-              alert('❌ 操作失败: ' + (data.error || '未知错误'));
-            }
-          } catch {
-            alert('❌ 网络错误');
-          }
-        });
-      });
-
-      // 单个删除
-      container.querySelectorAll('.delete-approved').forEach(function(btn) {
-        btn.addEventListener('click', async function() {
-          var domain = this.dataset.domain;
-          if (!confirm('确定要删除（拉黑） ' + domain + ' 吗？')) return;
-          try {
-            var resp = await fetch('/api/admin/approved', {
-              method: 'DELETE',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Admin-Key': currentAdminKey
-              },
-              body: JSON.stringify({ domain: domain })
-            });
-            var data = await resp.json();
-            if (resp.ok) {
-              alert('✅ ' + data.message);
-              document.getElementById('adminLoginBtn').click();
-            } else {
-              alert('❌ 操作失败: ' + (data.error || '未知错误'));
-            }
-          } catch {
-            alert('❌ 网络错误');
-          }
-        });
-      });
-
-      // 全选
-      var selectAll = document.getElementById('selectAllApproved');
-      if (selectAll) {
-        selectAll.addEventListener('change', function() {
-          var checkboxes = container.querySelectorAll('.approved-checkbox');
-          checkboxes.forEach(function(cb) { cb.checked = this.checked; });
-        });
-      }
-
-      // 批量删除
-      var batchBtn = document.getElementById('batchDeleteBtn');
-      if (batchBtn) {
-        batchBtn.addEventListener('click', async function() {
-          var checkboxes = container.querySelectorAll('.approved-checkbox:checked');
-          if (checkboxes.length === 0) {
-            alert('请至少选择一个域名');
-            return;
-          }
-          var domains = Array.from(checkboxes).map(function(cb) { return cb.dataset.domain; });
-          if (!confirm('确定要删除（拉黑）以下 ' + domains.length + ' 个域名吗？\n' + domains.join('、'))) return;
-          try {
-            var resp = await fetch('/api/admin/approved/batch', {
-              method: 'DELETE',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Admin-Key': currentAdminKey
-              },
-              body: JSON.stringify({ domains: domains })
-            });
-            var data = await resp.json();
-            if (resp.ok) {
-              alert('✅ ' + data.message);
-              document.getElementById('adminLoginBtn').click();
-            } else {
-              alert('❌ 操作失败: ' + (data.error || '未知错误'));
-            }
-          } catch {
-            alert('❌ 网络错误');
-          }
-        });
-      }
-
     } catch (e) {
       container.innerHTML = '<p style="color:#ef4444;">❌ 加载失败</p>';
     }
-  });
+  }
+
+  window.approveDomain = async function(domain, action) {
+    if (!confirm('确定要' + (action === 'approve' ? '通过' : '拒绝') + ' ' + domain + ' 吗？')) return;
+    try {
+      var resp = await fetch('/api/admin/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Key': currentAdminKey },
+        body: JSON.stringify({ domain: domain, action: action })
+      });
+      var data = await resp.json();
+      if (resp.ok) {
+        alert('✅ 操作成功');
+        loadAdmin();
+      } else {
+        alert('❌ 操作失败: ' + (data.error || '未知错误'));
+      }
+    } catch { alert('❌ 网络错误'); }
+  };
+
+  window.deleteSingle = async function(domain) {
+    if (!confirm('确定要删除（拉黑） ' + domain + ' 吗？')) return;
+    try {
+      var resp = await fetch('/api/admin/approved', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Key': currentAdminKey },
+        body: JSON.stringify({ domain: domain })
+      });
+      var data = await resp.json();
+      if (resp.ok) {
+        alert('✅ ' + data.message);
+        loadAdmin();
+      } else {
+        alert('❌ 操作失败: ' + (data.error || '未知错误'));
+      }
+    } catch { alert('❌ 网络错误'); }
+  };
+
+  window.batchDelete = async function() {
+    var checkboxes = document.querySelectorAll('.approved-checkbox:checked');
+    if (checkboxes.length === 0) { alert('请至少选择一个域名'); return; }
+    var domains = Array.from(checkboxes).map(cb => cb.dataset.domain);
+    if (!confirm('确定要删除（拉黑）以下 ' + domains.length + ' 个域名吗？\n' + domains.join('、'))) return;
+    try {
+      var resp = await fetch('/api/admin/approved/batch', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Key': currentAdminKey },
+        body: JSON.stringify({ domains: domains })
+      });
+      var data = await resp.json();
+      if (resp.ok) {
+        alert('✅ ' + data.message);
+        loadAdmin();
+      } else {
+        alert('❌ 操作失败: ' + (data.error || '未知错误'));
+      }
+    } catch { alert('❌ 网络错误'); }
+  };
+
+  function toggleAll(el) {
+    var checkboxes = document.querySelectorAll('.approved-checkbox');
+    checkboxes.forEach(cb => cb.checked = el.checked);
+  }
 </script>
 </body>
 </html>`;
@@ -1373,20 +1005,14 @@ export default {
       if (path === '/') {
         const domains = await getDomainList(env);
         let friends = [];
-        if (env.FRIEND_LINKS) {
-          try { friends = JSON.parse(env.FRIEND_LINKS); } catch (_) {}
-        }
+        if (env.FRIEND_LINKS) { try { friends = JSON.parse(env.FRIEND_LINKS); } catch (_) {} }
         const html = buildAppHtml(domains, friends);
-        return new Response(html, {
-          headers: { 'Content-Type': 'text/html; charset=utf-8' },
-        });
+        return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       }
 
       if (path.startsWith('/view/')) {
         const match = path.match(/^\/view\/([^\/]+)(\/.*)?$/);
-        if (!match) {
-          return new Response('Invalid view path', { status: 400 });
-        }
+        if (!match) return new Response('Invalid view path', { status: 400 });
         let domain = decodeURIComponent(match[1]);
         const rest = match[2] || '/';
         const search = url.search || '';
@@ -1394,25 +1020,13 @@ export default {
         if (domain.includes('*')) {
           const random = Math.random().toString(36).substring(2, 10);
           let newDomain = domain.replace(/\*/g, random);
-          const newViewPath = `/view/${encodeURIComponent(newDomain)}${rest}${search}${hash}`;
-          return new Response(null, {
-            status: 302,
-            headers: { Location: newViewPath },
-          });
+          return new Response(null, { status: 302, headers: { Location: `/view/${encodeURIComponent(newDomain)}${rest}${search}${hash}` } });
         }
-        const html = buildViewPage(domain, rest, search, hash);
-        return new Response(html, {
-          headers: { 'Content-Type': 'text/html; charset=utf-8' },
-        });
+        return new Response(buildViewPage(domain, rest, search, hash), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       }
 
-      if (path.startsWith('/api/')) {
-        return handleApi(request, env);
-      }
-
-      if (path.startsWith('/proxy/')) {
-        return handleProxy(request, env);
-      }
+      if (path.startsWith('/api/')) return handleApi(request, env);
+      if (path.startsWith('/proxy/')) return handleProxy(request, env);
 
       return new Response('未找到资源', { status: 404 });
     } catch (err) {
