@@ -6,7 +6,7 @@
 
 - ***.clra3.lzh173.chat
 
--clra.cc.cd
+- clra.cc.cd
 
 - *.clra.cc.cd
 
