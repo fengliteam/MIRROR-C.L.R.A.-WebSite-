@@ -1,5 +1,6 @@
 // ============================================================
-// CLRA Mirror - 强制全代理 + 泛域名支持 + 外链提示 + www 自动匹配
+// CLRA Mirror - iframe 内嵌代理浏览器版
+// 特性：所有代理页面显示在 iframe 中，地址栏同步，强制代理
 // ============================================================
 
 const CONFIG = {
@@ -17,7 +18,7 @@ let domainCache = null;
 let cacheTimestamp = 0;
 const rateMap = new Map();
 
-// ---------- 工具 ----------
+// ---------- 工具函数 ----------
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -49,44 +50,29 @@ function isRateLimited(ip) {
   return false;
 }
 
-// ---------- 增强白名单匹配（支持 www 自动继承） ----------
+// ---------- 增强白名单匹配（支持 www 自动继承、泛域名） ----------
 function isDomainAllowed(domain, allowedList) {
   if (!Array.isArray(allowedList) || allowedList.length === 0) return false;
-  
-  // 1. 精确匹配
   if (allowedList.includes(domain)) return true;
-  
-  // 2. 泛域名匹配（*.example.com）
   if (allowedList.some(p => p.startsWith('*.') && (domain === p.slice(2) || domain.endsWith('.' + p.slice(2))))) return true;
-  
-  // 3. 如果域名以 www. 开头，尝试匹配去掉前缀后的根域名
   if (domain.startsWith('www.')) {
     const base = domain.slice(4);
     if (allowedList.includes(base)) return true;
-    // 根域名也支持泛域名
     if (allowedList.some(p => p.startsWith('*.') && (base === p.slice(2) || base.endsWith('.' + p.slice(2))))) return true;
   }
-  
   return false;
 }
 
-// ---------- 强制全代理，绝不返回原始链接 ----------
+// ---------- 强制全代理（绝不返回原始链接） ----------
 function rewriteUrl(originalUrl, domain) {
   if (!originalUrl || typeof originalUrl !== 'string') return originalUrl;
   if (/^(data|blob|javascript|mailto|tel|ws|wss):/i.test(originalUrl)) return originalUrl;
   if (originalUrl.startsWith('/proxy/')) return originalUrl;
 
   let urlString = originalUrl;
-  if (urlString.startsWith('//')) {
-    urlString = 'https:' + urlString;
-  }
+  if (urlString.startsWith('//')) urlString = 'https:' + urlString;
 
-  let targetDomain = '';
-  let path = '';
-  let search = '';
-  let hash = '';
-
-  // 尝试解析
+  let targetDomain = '', path = '', search = '', hash = '';
   try {
     let urlObj;
     if (urlString.startsWith('http://') || urlString.startsWith('https://')) {
@@ -99,7 +85,6 @@ function rewriteUrl(originalUrl, domain) {
     search = urlObj.search || '';
     hash = urlObj.hash || '';
   } catch (_) {
-    // 解析失败（例如泛域名 *.example.com），手动提取
     let temp = urlString;
     if (temp.startsWith('http://')) temp = temp.slice(7);
     else if (temp.startsWith('https://')) temp = temp.slice(8);
@@ -123,23 +108,16 @@ function rewriteUrl(originalUrl, domain) {
     if (!path.startsWith('/')) path = '/' + path;
   }
 
-  if (!targetDomain || targetDomain === '') {
-    return '/proxy/blocked/';
-  }
-
+  if (!targetDomain || targetDomain === '') return '/proxy/blocked/';
   const proxyPath = `/proxy/${encodeURIComponent(targetDomain)}${path}${search}${hash}`;
-  if (proxyPath.length > CONFIG.MAX_URL_LENGTH) {
-    return '/proxy/blocked/';
-  }
+  if (proxyPath.length > CONFIG.MAX_URL_LENGTH) return '/proxy/blocked/';
   return proxyPath;
 }
 
 // ---------- 获取域名列表 ----------
 async function getDomainList(env) {
   const now = Date.now();
-  if (domainCache && (now - cacheTimestamp) < CONFIG.DOMAIN_CACHE_TTL * 1000) {
-    return domainCache;
-  }
+  if (domainCache && (now - cacheTimestamp) < CONFIG.DOMAIN_CACHE_TTL * 1000) return domainCache;
 
   const domainSet = new Set();
   CONFIG.HARDCODED_DOMAINS.forEach(d => domainSet.add(d));
@@ -185,7 +163,7 @@ async function getDomainList(env) {
   return domainCache;
 }
 
-// ---------- 代理处理 ----------
+// ---------- 代理处理（核心） ----------
 async function handleProxy(request, env) {
   const url = new URL(request.url);
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -210,13 +188,10 @@ async function handleProxy(request, env) {
     const random = Math.random().toString(36).substring(2, 10);
     let newDomain = domain.replace(/\*/g, random);
     const newProxyPath = `/proxy/${encodeURIComponent(newDomain)}${targetPath}${targetSearch}`;
-    return new Response(null, {
-      status: 302,
-      headers: { Location: newProxyPath },
-    });
+    return new Response(null, { status: 302, headers: { Location: newProxyPath } });
   }
 
-  // 白名单检查（增强 www 自动匹配）
+  // 白名单检查
   const allowedDomains = await getDomainList(env);
   if (!isDomainAllowed(domain, allowedDomains)) {
     const originalUrl = `https://${domain}${targetPath}${targetSearch}`;
@@ -237,10 +212,7 @@ async function handleProxy(request, env) {
       </body>
       </html>
     `;
-    return new Response(html, {
-      status: 403,
-      headers: { 'Content-Type': 'text/html; charset=utf-8' },
-    });
+    return new Response(html, { status: 403, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
   // 构造目标 URL
@@ -271,14 +243,12 @@ async function handleProxy(request, env) {
       redirect: 'manual',
     });
 
-    // ---------- 处理重定向 ----------
+    // 处理 30x 重定向
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('Location');
       if (location) {
         const newHeaders = new Headers(response.headers);
-        // 重写 Location，并确保后续重定向后的域名也能通过白名单检查
-        const rewrittenLocation = rewriteUrl(location, domain);
-        newHeaders.set('Location', rewrittenLocation);
+        newHeaders.set('Location', rewriteUrl(location, domain));
         return new Response(null, { status: response.status, headers: newHeaders });
       }
     }
@@ -288,9 +258,73 @@ async function handleProxy(request, env) {
     respHeaders.delete('content-security-policy');
     respHeaders.delete('content-security-policy-report-only');
 
-    // ---------- HTML 重写 ----------
+    // ---------- HTML 重写（注入前端拦截脚本） ----------
     if (contentType.includes('text/html')) {
+      const interceptorScript = `
+        <script>
+        (function() {
+          var originalDomain = '${domain}';
+          var proxyBase = '/proxy/';
+          function getProxyUrl(url) {
+            if (!url || url.startsWith(proxyBase) || /^(data|blob|javascript|mailto|tel|ws|wss):/i.test(url)) return url;
+            var fullUrl;
+            try {
+              fullUrl = new URL(url, window.location.origin);
+            } catch(e) {
+              return url;
+            }
+            if (fullUrl.pathname.startsWith(proxyBase)) return url;
+            var domain = fullUrl.hostname;
+            if (domain === window.location.hostname) {
+              fullUrl = new URL(url, 'https://' + originalDomain + '/');
+              domain = fullUrl.hostname;
+            }
+            var path = fullUrl.pathname;
+            var search = fullUrl.search;
+            var hash = fullUrl.hash;
+            return proxyBase + encodeURIComponent(domain) + path + search + hash;
+          }
+          document.addEventListener('click', function(e) {
+            var target = e.target.closest('a');
+            if (target && target.href) {
+              var proxyUrl = getProxyUrl(target.href);
+              if (proxyUrl !== target.href) {
+                e.preventDefault();
+                window.location.href = proxyUrl;
+              }
+            }
+          }, true);
+          document.addEventListener('submit', function(e) {
+            var form = e.target;
+            if (form && form.action) {
+              var proxyUrl = getProxyUrl(form.action);
+              if (proxyUrl !== form.action) {
+                e.preventDefault();
+                form.action = proxyUrl;
+                form.submit();
+              }
+            }
+          }, true);
+          var originalOpen = window.open;
+          window.open = function(url, name, features) {
+            if (url) {
+              var proxyUrl = getProxyUrl(url);
+              if (proxyUrl !== url) {
+                return originalOpen(proxyUrl, name, features);
+              }
+            }
+            return originalOpen(url, name, features);
+          };
+        })();
+        </script>
+      `;
+
       const rewriter = new HTMLRewriter()
+        .on('head', {
+          element(el) {
+            el.prepend(interceptorScript, { html: true });
+          }
+        })
         .on('a', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain)); } })
         .on('img', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain)); } })
         .on('script', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain)); } })
@@ -308,8 +342,7 @@ async function handleProxy(request, env) {
             if (content) {
               const match = content.match(/url=(.+)/i);
               if (match) {
-                const newUrl = rewriteUrl(match[1], domain);
-                el.setAttribute('content', content.replace(/url=.+/i, `url=${newUrl}`));
+                el.setAttribute('content', content.replace(/url=.+/i, `url=${rewriteUrl(match[1], domain)}`));
               }
             }
           }
@@ -347,7 +380,7 @@ async function handleProxy(request, env) {
       );
     }
 
-    // ---------- CSS 重写 ----------
+    // CSS 重写
     if (contentType.includes('text/css')) {
       const cssText = await response.text();
       const rewritten = cssText
@@ -363,7 +396,189 @@ async function handleProxy(request, env) {
   }
 }
 
-// ---------- API 处理 ----------
+// ---------- iframe 浏览器页面 ----------
+function buildViewPage(domain, path, search, hash) {
+  const fullPath = path || '/';
+  const fullSearch = search || '';
+  const fullHash = hash || '';
+  const proxySrc = `/proxy/${encodeURIComponent(domain)}${fullPath}${fullSearch}${fullHash}`;
+  const displayUrl = `https://${domain}${fullPath}${fullSearch}${fullHash}`;
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CLRA 浏览器 - ${escapeHtml(domain)}</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #1e293b; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+    #toolbar {
+      background: #0f172a;
+      color: #f1f5f9;
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid #334155;
+      flex-shrink: 0;
+    }
+    #toolbar button {
+      background: #334155;
+      border: none;
+      color: #f1f5f9;
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: 0.2s;
+    }
+    #toolbar button:hover { background: #475569; }
+    #toolbar button:active { transform: scale(0.95); }
+    #address-bar {
+      flex: 1;
+      min-width: 200px;
+      padding: 6px 12px;
+      border-radius: 20px;
+      border: 1px solid #475569;
+      background: #1e293b;
+      color: #f1f5f9;
+      font-size: 14px;
+      outline: none;
+    }
+    #address-bar:focus { border-color: #60a5fa; }
+    #iframe-container {
+      flex: 1;
+      background: #0f172a;
+    }
+    iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+      background: #fff;
+    }
+    .status-text {
+      color: #94a3b8;
+      font-size: 12px;
+      margin-left: 8px;
+    }
+    @media (max-width: 640px) {
+      #toolbar { padding: 4px 8px; gap: 4px; }
+      #address-bar { font-size: 12px; padding: 4px 8px; }
+      #toolbar button { width: 28px; height: 28px; font-size: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <button id="backBtn" title="后退">←</button>
+    <button id="forwardBtn" title="前进">→</button>
+    <button id="refreshBtn" title="刷新">⟳</button>
+    <input type="text" id="address-bar" value="${escapeHtml(displayUrl)}" spellcheck="false" />
+    <span class="status-text" id="statusText">就绪</span>
+  </div>
+  <div id="iframe-container">
+    <iframe id="proxyFrame" src="${escapeHtml(proxySrc)}"></iframe>
+  </div>
+
+  <script>
+    (function() {
+      var iframe = document.getElementById('proxyFrame');
+      var addressBar = document.getElementById('address-bar');
+      var statusText = document.getElementById('statusText');
+      var backBtn = document.getElementById('backBtn');
+      var forwardBtn = document.getElementById('forwardBtn');
+      var refreshBtn = document.getElementById('refreshBtn');
+
+      // 更新地址栏
+      function updateAddress() {
+        try {
+          var frameUrl = iframe.contentWindow.location.href;
+          if (frameUrl) {
+            // 提取域名和路径
+            var urlObj = new URL(frameUrl);
+            var path = urlObj.pathname + urlObj.search + urlObj.hash;
+            // 去掉 /proxy/ 前缀
+            var match = path.match(/^\\/proxy\\/([^\\/]+)(\\/.*)?$/);
+            if (match) {
+              var domain = match[1];
+              var rest = match[2] || '/';
+              addressBar.value = 'https://' + domain + rest;
+              statusText.textContent = '加载完成';
+            } else {
+              addressBar.value = frameUrl;
+            }
+          }
+        } catch(e) {
+          // 跨域或其他错误，忽略
+        }
+      }
+
+      // 监听 iframe 加载完成
+      iframe.addEventListener('load', function() {
+        setTimeout(updateAddress, 100);
+        statusText.textContent = '加载中...';
+      });
+
+      // 地址栏回车：解析并导航
+      addressBar.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+          var input = addressBar.value.trim();
+          if (!input) return;
+          // 如果输入的是域名，加上 https://
+          if (!input.startsWith('http://') && !input.startsWith('https://')) {
+            input = 'https://' + input;
+          }
+          try {
+            var urlObj = new URL(input);
+            var domain = urlObj.hostname;
+            var path = urlObj.pathname + urlObj.search + urlObj.hash;
+            // 跳转到 /view/域名/路径
+            var viewPath = '/view/' + encodeURIComponent(domain) + path;
+            window.location.href = viewPath;
+          } catch(e) {
+            alert('无效的 URL');
+          }
+        }
+      });
+
+      // 后退
+      backBtn.addEventListener('click', function() {
+        try { iframe.contentWindow.history.back(); } catch(e) {}
+      });
+
+      // 前进
+      forwardBtn.addEventListener('click', function() {
+        try { iframe.contentWindow.history.forward(); } catch(e) {}
+      });
+
+      // 刷新
+      refreshBtn.addEventListener('click', function() {
+        try { iframe.contentWindow.location.reload(); } catch(e) {}
+      });
+
+      // 如果 iframe 加载失败，显示错误
+      iframe.addEventListener('error', function() {
+        statusText.textContent = '加载失败';
+      });
+
+      // 首次加载后更新地址
+      setTimeout(updateAddress, 300);
+
+      // 监听 iframe 内的导航（通过 popstate 无法跨域，但同源可以）
+      // 实际上由于同源，我们可以监听 iframe 的 load 事件即可
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+// ---------- API 处理（同前，保持不变） ----------
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const method = request.method;
@@ -497,15 +712,16 @@ async function handleApi(request, env) {
   return new Response('API 路径不存在', { status: 404 });
 }
 
-// ---------- 构建 HTML ----------
+// ---------- 构建管理界面 HTML（含 iframe 入口） ----------
 function buildAppHtml(domains, friendLinks) {
+  // 域名列表：点击跳转到 /view/域名
   const domainItems = domains.map(d => {
     const isWildcard = d.startsWith('*.');
     if (isWildcard) {
       const base = d.slice(2);
       return `<span class="domain-link wildcard-domain" data-base="${escapeHtml(base)}" data-original="${escapeHtml(d)}" title="点击随机子域名">${escapeHtml(d)} <span class="badge">随机</span></span>`;
     } else {
-      return `<a href="/proxy/${encodeURIComponent(d)}/" class="domain-link" target="_blank">${escapeHtml(d)}</a>`;
+      return `<a href="/view/${encodeURIComponent(d)}/" class="domain-link" target="_blank">${escapeHtml(d)}</a>`;
     }
   }).join('');
 
@@ -513,10 +729,10 @@ function buildAppHtml(domains, friendLinks) {
     const name = escapeHtml(f.name || f.url);
     const url = f.url;
     let domain = url.replace(/^https?:\/\//, '').split('/')[0];
-    const proxyUrl = `/proxy/${encodeURIComponent(domain)}/`;
+    const viewUrl = `/view/${encodeURIComponent(domain)}/`;
     return `
       <div class="friend-item">
-        <a href="${proxyUrl}" target="_blank" class="friend-link">
+        <a href="${viewUrl}" target="_blank" class="friend-link">
           <span class="friend-name">${name}</span>
           <span class="friend-domain">${escapeHtml(domain)}</span>
         </a>
@@ -849,11 +1065,12 @@ function buildAppHtml(domains, friendLinks) {
 <body>
 
 <nav class="navbar">
-  <a href="#" class="brand">🌐 <span>CLRA</span></a>
+  <a href="/" class="brand">🌐 <span>CLRA</span></a>
   <button class="nav-link active" data-page="home">首页</button>
   <button class="nav-link" data-page="submit">提交</button>
   <button class="nav-link" data-page="admin">审核</button>
   <button class="nav-link" data-page="friends">友链</button>
+  <a href="/view/clra1.lzh173.chat/" class="nav-link" target="_blank">浏览器</a>
 </nav>
 
 <div class="container">
@@ -867,7 +1084,7 @@ function buildAppHtml(domains, friendLinks) {
       </div>
       <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:1rem; display:flex; justify-content:space-between; flex-wrap:wrap;">
         <span>共 <strong>${domains.length}</strong> 个</span>
-        <span>点击即可通过代理访问</span>
+        <span>点击后在 iframe 中代理访问</span>
       </div>
     </div>
   </div>
@@ -904,7 +1121,7 @@ function buildAppHtml(domains, friendLinks) {
         ${friendItems || '<p style="color:var(--text-secondary);">暂无友链，请在环境变量中配置 FRIEND_LINKS</p>'}
       </div>
       <div style="margin-top:1rem; font-size:0.9rem; color:var(--text-secondary);">
-        点击友链名称将通过代理访问
+        点击友链名称将在 iframe 中代理访问
       </div>
     </div>
   </div>
@@ -919,7 +1136,7 @@ function buildAppHtml(domains, friendLinks) {
       this.classList.add('active');
       const page = this.dataset.page;
       document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-      document.getElementById('page-' + page).classList.add('active');
+      if (page) document.getElementById('page-' + page).classList.add('active');
     });
   });
 
@@ -933,7 +1150,7 @@ function buildAppHtml(domains, friendLinks) {
   }
   window.filterDomains = filterDomains;
 
-  // 泛域名随机
+  // 泛域名随机点击（跳转到 /view/随机子域名）
   document.addEventListener('click', function(e) {
     const target = e.target.closest('.wildcard-domain');
     if (target) {
@@ -941,13 +1158,13 @@ function buildAppHtml(domains, friendLinks) {
       if (base) {
         const random = Math.random().toString(36).substring(2, 10);
         const subdomain = random + '.' + base;
-        window.open('/proxy/' + encodeURIComponent(subdomain) + '/', '_blank');
+        window.open('/view/' + encodeURIComponent(subdomain) + '/', '_blank');
       }
       e.preventDefault();
     }
   });
 
-  // 提交域名
+  // 提交域名（不变）
   document.getElementById('submitBtn').addEventListener('click', async function() {
     const input = document.getElementById('submitDomainInput');
     const domain = input.value.trim();
@@ -978,7 +1195,7 @@ function buildAppHtml(domains, friendLinks) {
     setTimeout(() => { el.style.display = 'none'; }, 5000);
   }
 
-  // 管理员
+  // 管理员（不变）
   let currentAdminKey = '';
   document.getElementById('adminLoginBtn').addEventListener('click', async function() {
     const keyInput = document.getElementById('adminKeyInput');
@@ -1182,6 +1399,7 @@ export default {
     const path = url.pathname;
 
     try {
+      // 根路径 -> 管理界面
       if (path === '/') {
         const domains = await getDomainList(env);
         let friends = [];
@@ -1194,10 +1412,41 @@ export default {
         });
       }
 
+      // iframe 浏览器页面
+      if (path.startsWith('/view/')) {
+        // 提取域名和路径
+        const match = path.match(/^\/view\/([^\/]+)(\/.*)?$/);
+        if (!match) {
+          return new Response('Invalid view path', { status: 400 });
+        }
+        let domain = decodeURIComponent(match[1]);
+        const rest = match[2] || '/';
+        // 处理查询参数和哈希
+        const search = url.search || '';
+        const hash = url.hash || '';
+        // 如果 domain 包含 *，随机生成子域名并重定向到 /view/新域名
+        if (domain.includes('*')) {
+          const random = Math.random().toString(36).substring(2, 10);
+          let newDomain = domain.replace(/\*/g, random);
+          const newViewPath = `/view/${encodeURIComponent(newDomain)}${rest}${search}${hash}`;
+          return new Response(null, {
+            status: 302,
+            headers: { Location: newViewPath },
+          });
+        }
+        // 返回浏览器页面
+        const html = buildViewPage(domain, rest, search, hash);
+        return new Response(html, {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      }
+
+      // API
       if (path.startsWith('/api/')) {
         return handleApi(request, env);
       }
 
+      // 代理
       if (path.startsWith('/proxy/')) {
         return handleProxy(request, env);
       }
