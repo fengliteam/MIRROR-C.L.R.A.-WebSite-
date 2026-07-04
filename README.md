@@ -12,4 +12,4 @@
 
 - *.clra.cc.cd
 
-- clra.xingying
+- clra.xingying.us.kg
