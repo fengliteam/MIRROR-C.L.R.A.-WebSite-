@@ -1,5 +1,5 @@
 // ============================================================
-// CLRA Mirror - 独立页面版（修复 admin 语法错误 + 资源直连）
+// CLRA Mirror - 修复 X-Frame-Options + 外部资源直连 + 独立页面
 // ============================================================
 
 const CONFIG = {
@@ -18,7 +18,6 @@ let domainCache = null;
 let cacheTimestamp = 0;
 const rateMap = new Map();
 
-// ---------- 工具函数 ----------
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -50,7 +49,6 @@ function isRateLimited(ip) {
   return false;
 }
 
-// ---------- 白名单匹配 ----------
 function isDomainAllowed(domain, allowedList) {
   if (!Array.isArray(allowedList) || allowedList.length === 0) return false;
   const lowerDomain = domain.toLowerCase();
@@ -67,7 +65,6 @@ function isDomainAllowed(domain, allowedList) {
   return false;
 }
 
-// ---------- URL 重写（资源直连控制） ----------
 function rewriteUrl(originalUrl, domain, isResource = false) {
   if (!originalUrl || typeof originalUrl !== 'string') return originalUrl;
   if (/^(data|blob|javascript|mailto|tel|ws|wss):/i.test(originalUrl)) return originalUrl;
@@ -128,7 +125,6 @@ function rewriteUrl(originalUrl, domain, isResource = false) {
   return proxyPath;
 }
 
-// ---------- 获取域名列表 ----------
 async function getDomainList(env) {
   const now = Date.now();
   if (domainCache && (now - cacheTimestamp) < CONFIG.DOMAIN_CACHE_TTL * 1000) return domainCache;
@@ -177,7 +173,6 @@ async function getDomainList(env) {
   return domainCache;
 }
 
-// ---------- 代理处理 ----------
 async function handleProxy(request, env) {
   const url = new URL(request.url);
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -244,7 +239,7 @@ async function handleProxy(request, env) {
   ['cookie', 'authorization', 'proxy-authorization', 'x-forwarded-for', 'x-real-ip', 'cf-connecting-ip']
     .forEach(h => reqHeaders.delete(h));
   reqHeaders.set('X-Forwarded-Host', domain);
-  reqHeaders.set('User-Agent', 'CLRA-Mirror-Proxy/2.0');
+  reqHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
 
   try {
     const response = await fetch(targetUrl, {
@@ -265,6 +260,8 @@ async function handleProxy(request, env) {
 
     const contentType = response.headers.get('content-type') || '';
     const respHeaders = new Headers(response.headers);
+    // 移除阻止 iframe 嵌入的头
+    respHeaders.delete('x-frame-options');
     respHeaders.delete('content-security-policy');
     respHeaders.delete('content-security-policy-report-only');
 
@@ -416,7 +413,6 @@ async function handleProxy(request, env) {
   }
 }
 
-// ---------- iframe 浏览器页面 ----------
 function buildViewPage(domain, path, search, hash) {
   const fullPath = path || '/';
   const fullSearch = search || '';
@@ -578,7 +574,6 @@ function buildViewPage(domain, path, search, hash) {
 </html>`;
 }
 
-// ---------- API 处理 ----------
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const method = request.method;
@@ -1028,7 +1023,6 @@ function navLinks(activePath) {
   return html;
 }
 
-// ---------- 首页 ----------
 function buildHomePage(domains) {
   const domainItems = domains.map(d => {
     if (d.startsWith('*.')) {
@@ -1075,7 +1069,6 @@ function buildHomePage(domains) {
 </html>`;
 }
 
-// ---------- 提交页面 ----------
 function buildSubmitPage() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1135,7 +1128,6 @@ function buildSubmitPage() {
 </html>`;
 }
 
-// ---------- 管理页面（彻底修复 JS 语法）----------
 function buildAdminPage() {
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1342,7 +1334,6 @@ function buildAdminPage() {
   return html;
 }
 
-// ---------- 友链页面 ----------
 function buildFriendsPage(friendLinks) {
   const friendItems = (friendLinks || []).map(f => {
     const name = escapeHtml(f.name || f.url);
@@ -1383,7 +1374,6 @@ function buildFriendsPage(friendLinks) {
 </html>`;
 }
 
-// ---------- 主入口 ----------
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
