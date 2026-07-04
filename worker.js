@@ -67,21 +67,24 @@ function isDomainAllowed(domain, allowedList) {
   return false;
 }
 
-// ---------- URL 重写（外部资源直连） ----------
-function rewriteUrl(originalUrl, domain) {
+// ---------- URL 重写（增加资源直连控制） ----------
+function rewriteUrl(originalUrl, domain, isResource = false) {
   if (!originalUrl || typeof originalUrl !== 'string') return originalUrl;
   // 特殊协议直接返回
   if (/^(data|blob|javascript|mailto|tel|ws|wss):/i.test(originalUrl)) return originalUrl;
   if (originalUrl.startsWith('/proxy/')) return originalUrl;
 
-  // 对于 cloudflareinsights.com 等外部资源，直接返回原始 URL，不代理
-  const externalDomains = ['static.cloudflareinsights.com', 'performance.radar.cloudflare.com'];
+  // 尝试解析域
+  let resolvedDomain = '';
   try {
-    const urlObj = new URL(originalUrl);
-    if (externalDomains.includes(urlObj.hostname)) {
-      return originalUrl;
-    }
+    const temp = new URL(originalUrl, `https://${domain}/`);
+    resolvedDomain = temp.hostname;
   } catch (_) {}
+
+  // 资源模式：如果解析出的域名与当前代理域不同（且非相对路径），直接返回原始URL（直连）
+  if (isResource && resolvedDomain && resolvedDomain.toLowerCase() !== domain.toLowerCase()) {
+    return originalUrl;
+  }
 
   let urlString = originalUrl;
   if (urlString.startsWith('//')) urlString = 'https:' + urlString;
@@ -261,7 +264,7 @@ async function handleProxy(request, env) {
       const location = response.headers.get('Location');
       if (location) {
         const newHeaders = new Headers(response.headers);
-        newHeaders.set('Location', rewriteUrl(location, domain));
+        newHeaders.set('Location', rewriteUrl(location, domain, false)); // 导航跳转
         return new Response(null, { status: response.status, headers: newHeaders });
       }
     }
@@ -279,12 +282,6 @@ async function handleProxy(request, env) {
           var proxyBase = '/proxy/';
           function getProxyUrl(url) {
             if (!url || url.startsWith(proxyBase) || /^(data|blob|javascript|mailto|tel|ws|wss):/i.test(url)) return url;
-            // 外部资源直连
-            var externalDomains = ['static.cloudflareinsights.com', 'performance.radar.cloudflare.com'];
-            try {
-              var urlObj = new URL(url);
-              if (externalDomains.includes(urlObj.hostname)) return url;
-            } catch(e) {}
             var fullUrl;
             try {
               fullUrl = new URL(url, window.location.origin);
@@ -343,47 +340,40 @@ async function handleProxy(request, env) {
             el.prepend(interceptorScript, { html: true });
           }
         })
-        .on('a', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain)); } })
-        .on('img', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain)); } })
-        .on('script', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain)); } })
+        // 导航类元素：使用代理重写
+        .on('a', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain, false)); } })
+        .on('form', { element(el) { const v = el.getAttribute('action'); if (v) el.setAttribute('action', rewriteUrl(v, domain, false)); } })
+        .on('area', { element(el) { const v = el.getAttribute('href'); if (v) el.setAttribute('href', rewriteUrl(v, domain, false)); } })
+        // 资源类元素：同域代理，外域直连
+        .on('img', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true)); } })
+        .on('script', {
+          element(el) {
+            const src = el.getAttribute('src');
+            // 移除 Cloudflare 遥测脚本（可选）
+            if (src && (src.includes('static.cloudflareinsights.com') || src.includes('performance.radar.cloudflare.com'))) {
+              el.remove();
+            } else if (src) {
+              el.setAttribute('src', rewriteUrl(src, domain, true));
+            }
+          }
+        })
         .on('link', { element(el) {
           const rel = el.getAttribute('rel');
           if (['stylesheet', 'preload', 'preconnect', 'dns-prefetch', 'icon', 'apple-touch-icon'].includes(rel)) {
             const v = el.getAttribute('href');
-            if (v) el.setAttribute('href', rewriteUrl(v, domain));
+            if (v) el.setAttribute('href', rewriteUrl(v, domain, true));
           }
         }})
-        .on('form', { element(el) { const v = el.getAttribute('action'); if (v) el.setAttribute('action', rewriteUrl(v, domain)); } })
-        .on('meta', { element(el) {
-          if (el.getAttribute('http-equiv')?.toLowerCase() === 'refresh') {
-            const content = el.getAttribute('content');
-            if (content) {
-              const match = content.match(/url=(.+)/i);
-              if (match) {
-                el.setAttribute('content', content.replace(/url=.+/i, `url=${rewriteUrl(match[1], domain)}`));
-              }
-            }
-          }
-        }})
-        .on('style', { text(text) {
-          const rewritten = text.text.replace(
-            /url\((['"]?)([^'")]+)(['"]?)\)/g,
-            (_, q1, urlPart, q2) => `url(${q1}${rewriteUrl(urlPart.trim(), domain)}${q2})`
-          );
-          text.replace(rewritten);
-        }})
-        .on('object', { element(el) { const v = el.getAttribute('data'); if (v) el.setAttribute('data', rewriteUrl(v, domain)); } })
-        .on('embed', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain)); } })
         .on('source', { element(el) {
           const v = el.getAttribute('src');
-          if (v) el.setAttribute('src', rewriteUrl(v, domain));
+          if (v) el.setAttribute('src', rewriteUrl(v, domain, true));
           const srcset = el.getAttribute('srcset');
           if (srcset) {
             const newSrcset = srcset.split(',').map(part => {
               const trimmed = part.trim();
               const parts = trimmed.split(/\s+/);
               if (parts.length > 0) {
-                parts[0] = rewriteUrl(parts[0], domain);
+                parts[0] = rewriteUrl(parts[0], domain, true);
                 return parts.join(' ');
               }
               return trimmed;
@@ -391,7 +381,31 @@ async function handleProxy(request, env) {
             el.setAttribute('srcset', newSrcset);
           }
         }})
-        .on('video', { element(el) { const v = el.getAttribute('poster'); if (v) el.setAttribute('poster', rewriteUrl(v, domain)); } });
+        .on('video', { element(el) { const v = el.getAttribute('poster'); if (v) el.setAttribute('poster', rewriteUrl(v, domain, true)); } })
+        .on('audio', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true)); } })
+        .on('embed', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true)); } })
+        .on('object', { element(el) { const v = el.getAttribute('data'); if (v) el.setAttribute('data', rewriteUrl(v, domain, true)); } })
+        .on('iframe', { element(el) { const v = el.getAttribute('src'); if (v) el.setAttribute('src', rewriteUrl(v, domain, true)); } })
+        // meta refresh 导航重写
+        .on('meta', { element(el) {
+          if (el.getAttribute('http-equiv')?.toLowerCase() === 'refresh') {
+            const content = el.getAttribute('content');
+            if (content) {
+              const match = content.match(/url=(.+)/i);
+              if (match) {
+                el.setAttribute('content', content.replace(/url=.+/i, `url=${rewriteUrl(match[1], domain, false)}`));
+              }
+            }
+          }
+        }})
+        // 内联 style 重写（资源模式）
+        .on('style', { text(text) {
+          const rewritten = text.text.replace(
+            /url\((['"]?)([^'")]+)(['"]?)\)/g,
+            (_, q1, urlPart, q2) => `url(${q1}${rewriteUrl(urlPart.trim(), domain, true)}${q2})`
+          );
+          text.replace(rewritten);
+        }});
 
       return rewriter.transform(
         new Response(response.body, { status: response.status, headers: respHeaders })
@@ -401,8 +415,8 @@ async function handleProxy(request, env) {
     if (contentType.includes('text/css')) {
       const cssText = await response.text();
       const rewritten = cssText
-        .replace(/url\((['"]?)([^'")]+)(['"]?)\)/g, (_, q1, urlPart, q2) => `url(${q1}${rewriteUrl(urlPart.trim(), domain)}${q2})`)
-        .replace(/@import\s+(['"])([^'"]+)(['"])/g, (_, q1, url, q2) => `@import ${q1}${rewriteUrl(url, domain)}${q2}`);
+        .replace(/url\((['"]?)([^'")]+)(['"]?)\)/g, (_, q1, urlPart, q2) => `url(${q1}${rewriteUrl(urlPart.trim(), domain, true)}${q2})`)
+        .replace(/@import\s+(['"])([^'"]+)(['"])/g, (_, q1, urlStr, q2) => `@import ${q1}${rewriteUrl(urlStr, domain, true)}${q2}`);
       return new Response(rewritten, { status: response.status, headers: respHeaders });
     }
 
@@ -518,7 +532,7 @@ function buildViewPage(domain, path, search, hash) {
           if (frameUrl) {
             var urlObj = new URL(frameUrl);
             var path = urlObj.pathname + urlObj.search + urlObj.hash;
-            var match = path.match(/^\\/proxy\\/([^\\/]+)(\\/.*)?$/);
+            var match = path.match(/^\/proxy\/([^\/]+)(\/.*)?$/);
             if (match) {
               var domain = match[1];
               var rest = match[2] || '/';
@@ -709,13 +723,15 @@ async function handleApi(request, env) {
   return new Response('API 路径不存在', { status: 404 });
 }
 
-// ---------- 构建管理界面 HTML ----------
+// ---------- 构建管理界面 HTML（泛域名显示为随机子域名）----------
 function buildAppHtml(domains, friendLinks) {
   const domainItems = domains.map(d => {
-    const isWildcard = d.startsWith('*.');
-    if (isWildcard) {
+    if (d.startsWith('*.')) {
+      // 泛域名显示为随机子域名，无“随机”标签
       const base = d.slice(2);
-      return `<span class="domain-link wildcard-domain" data-base="${escapeHtml(base)}" style="cursor:pointer;">${escapeHtml(d)} <span class="badge">随机</span></span>`;
+      const random = Math.random().toString(36).substring(2, 10);
+      const display = random + '.' + base;
+      return `<a href="/view/${encodeURIComponent(display)}/" class="domain-link" target="_blank">${escapeHtml(display)}</a>`;
     } else {
       return `<a href="/view/${encodeURIComponent(d)}/" class="domain-link" target="_blank">${escapeHtml(d)}</a>`;
     }
@@ -906,15 +922,6 @@ function buildAppHtml(domains, friendLinks) {
       transform: scale(1.04);
       border-color: var(--link-color);
     }
-    .badge {
-      font-size: 0.6rem;
-      background: var(--badge-bg);
-      color: var(--badge-text);
-      padding: 0.1rem 0.5rem;
-      border-radius: 20px;
-      font-weight: 600;
-      letter-spacing: 0.3px;
-    }
     .friend-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
@@ -1062,10 +1069,10 @@ function buildAppHtml(domains, friendLinks) {
 
 <nav class="navbar">
   <a href="/" class="brand">🌐 <span>CLRA</span></a>
-  <button class="nav-link active" data-page="home">首页</button>
-  <button class="nav-link" data-page="submit">提交</button>
-  <button class="nav-link" data-page="admin">审核</button>
-  <button class="nav-link" data-page="friends">友链</button>
+  <button type="button" class="nav-link active" data-page="home">首页</button>
+  <button type="button" class="nav-link" data-page="submit">提交</button>
+  <button type="button" class="nav-link" data-page="admin">审核</button>
+  <button type="button" class="nav-link" data-page="friends">友链</button>
   <a href="/view/clra1.lzh173.chat/" class="nav-link" target="_blank">浏览器</a>
 </nav>
 
@@ -1090,7 +1097,7 @@ function buildAppHtml(domains, friendLinks) {
       <p style="color:var(--text-secondary); margin-bottom:1.2rem;">支持泛域名，如 <code>*.example.com</code></p>
       <div style="display:flex; gap:0.8rem; flex-wrap:wrap;">
         <input type="text" id="submitDomainInput" class="search-box" style="flex:1; min-width:200px;" placeholder="example.com 或 *.example.com">
-        <button class="btn" id="submitBtn">提交审核</button>
+        <button type="button" class="btn" id="submitBtn">提交审核</button>
       </div>
       <div id="submitMsg" class="msg"></div>
     </div>
@@ -1101,7 +1108,7 @@ function buildAppHtml(domains, friendLinks) {
       <div class="card-title">🔐 管理员审核</div>
       <div class="admin-key-area">
         <input type="password" id="adminKeyInput" placeholder="管理密钥">
-        <button class="btn" id="adminLoginBtn">加载数据</button>
+        <button type="button" class="btn" id="adminLoginBtn">加载数据</button>
       </div>
       <div id="adminContent">
         <p style="color:var(--text-secondary);">输入密钥后点击加载</p>
@@ -1152,20 +1159,6 @@ function buildAppHtml(domains, friendLinks) {
   }
   window.filterDomains = filterDomains;
 
-  // ---------- 泛域名点击 ----------
-  document.addEventListener('click', function(e) {
-    var target = e.target.closest('.wildcard-domain');
-    if (target) {
-      var base = target.getAttribute('data-base');
-      if (base) {
-        var random = Math.random().toString(36).substring(2, 10);
-        var subdomain = random + '.' + base;
-        window.location.href = '/view/' + encodeURIComponent(subdomain) + '/';
-      }
-      e.preventDefault();
-    }
-  });
-
   // ---------- 提交域名 ----------
   document.getElementById('submitBtn').addEventListener('click', async function() {
     var input = document.getElementById('submitDomainInput');
@@ -1197,7 +1190,7 @@ function buildAppHtml(domains, friendLinks) {
     setTimeout(function() { el.style.display = 'none'; }, 5000);
   }
 
-  // ---------- 管理员（带 XSS 转义） ----------
+  // ---------- 管理员（带 XSS 转义）----------
   var currentAdminKey = '';
   document.getElementById('adminLoginBtn').addEventListener('click', async function() {
     var keyInput = document.getElementById('adminKeyInput');
@@ -1220,7 +1213,7 @@ function buildAppHtml(domains, friendLinks) {
       var approved = await approvedResp.json();
 
       var html = '';
-      html += '<div class="tab-bar"><button class="tab-btn active" data-tab="pending-tab">待审核 (' + pending.length + ')</button><button class="tab-btn" data-tab="approved-tab">已审核 (' + approved.length + ')</button></div>';
+      html += '<div class="tab-bar"><button type="button" class="tab-btn active" data-tab="pending-tab">待审核 (' + pending.length + ')</button><button type="button" class="tab-btn" data-tab="approved-tab">已审核 (' + approved.length + ')</button></div>';
       html += '<div id="pending-tab" class="tab-content active"><h3 style="margin:0 0 1rem 0;">📋 待审核域名</h3>';
       if (!Array.isArray(pending) || pending.length === 0) {
         html += '<p style="color:#22c55e;">✅ 暂无待审核域名</p>';
@@ -1234,7 +1227,7 @@ function buildAppHtml(domains, friendLinks) {
       }
       html += '</div>';
 
-      html += '<div id="approved-tab" class="tab-content"><h3 style="margin:0 0 1rem 0;">✅ 已审核域名</h3><div style="margin-bottom:1rem;"><button class="btn btn-danger btn-sm" id="batchDeleteBtn">删除选中</button><span style="margin-left:1rem; font-size:0.85rem; color:var(--text-secondary);">勾选后点击删除可批量拉黑</span></div>';
+      html += '<div id="approved-tab" class="tab-content"><h3 style="margin:0 0 1rem 0;">✅ 已审核域名</h3><div style="margin-bottom:1rem;"><button type="button" class="btn btn-danger btn-sm" id="batchDeleteBtn">删除选中</button><span style="margin-left:1rem; font-size:0.85rem; color:var(--text-secondary);">勾选后点击删除可批量拉黑</span></div>';
       if (!Array.isArray(approved) || approved.length === 0) {
         html += '<p style="color:var(--text-secondary);">暂无已审核域名</p>';
       } else {
@@ -1361,12 +1354,6 @@ function buildAppHtml(domains, friendLinks) {
       container.innerHTML = '<p style="color:#ef4444;">❌ 加载失败</p>';
     }
   });
-
-  // 友链空提示
-  var friendGrid = document.querySelector('.friend-grid');
-  if (friendGrid && friendGrid.children.length === 0) {
-    friendGrid.innerHTML = '<p style="color:var(--text-secondary);">暂无友链，请在环境变量中配置 FRIEND_LINKS</p>';
-  }
 </script>
 </body>
 </html>`;
