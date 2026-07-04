@@ -1,5 +1,5 @@
 // ============================================================
-// CLRA Mirror - iframe 内嵌代理浏览器版（泛域名点击修复）
+// CLRA Mirror - 单文件完整版（泛域名点击修复 + 移除多余文字）
 // ============================================================
 
 const CONFIG = {
@@ -49,7 +49,7 @@ function isRateLimited(ip) {
   return false;
 }
 
-// ---------- 白名单匹配（大小写不敏感，支持 www 自动继承） ----------
+// ---------- 白名单匹配（大小写不敏感，支持 www） ----------
 function isDomainAllowed(domain, allowedList) {
   if (!Array.isArray(allowedList) || allowedList.length === 0) return false;
   const lowerDomain = domain.toLowerCase();
@@ -63,7 +63,6 @@ function isDomainAllowed(domain, allowedList) {
     if (lowerAllowed.includes(base)) return true;
     if (lowerAllowed.some(p => p.startsWith('*.') && (base === p.slice(2) || base.endsWith('.' + p.slice(2))))) return true;
   }
-  
   return false;
 }
 
@@ -118,7 +117,7 @@ function rewriteUrl(originalUrl, domain) {
   return proxyPath;
 }
 
-// ---------- 获取域名列表（统一转为小写） ----------
+// ---------- 获取域名列表（统一小写） ----------
 async function getDomainList(env) {
   const now = Date.now();
   if (domainCache && (now - cacheTimestamp) < CONFIG.DOMAIN_CACHE_TTL * 1000) return domainCache;
@@ -690,19 +689,20 @@ async function handleApi(request, env) {
   return new Response('API 路径不存在', { status: 404 });
 }
 
-// ---------- 构建管理界面 HTML ----------
+// ---------- HTML 模板拆分 ----------
 function buildAppHtml(domains, friendLinks) {
-  // 泛域名标签添加 onclick 直接调用函数
+  // 生成域名标签
   const domainItems = domains.map(d => {
     const isWildcard = d.startsWith('*.');
     if (isWildcard) {
       const base = d.slice(2);
-      return `<span class="domain-link wildcard-domain" data-base="${escapeHtml(base)}" onclick="handleWildcardClick(this)" style="cursor:pointer;">${escapeHtml(d)} <span class="badge">随机</span></span>`;
+      return `<span class="domain-link wildcard-domain" data-base="${escapeHtml(base)}" style="cursor:pointer;">${escapeHtml(d)} <span class="badge">随机</span></span>`;
     } else {
       return `<a href="/view/${encodeURIComponent(d)}/" class="domain-link" target="_blank">${escapeHtml(d)}</a>`;
     }
   }).join('');
 
+  // 生成友链
   const friendItems = (friendLinks || []).map(f => {
     const name = escapeHtml(f.name || f.url);
     const url = f.url;
@@ -1060,9 +1060,8 @@ function buildAppHtml(domains, friendLinks) {
       <div id="domainList" class="domain-grid">
         ${domainItems}
       </div>
-      <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:1rem; display:flex; justify-content:space-between; flex-wrap:wrap;">
-        <span>共 <strong>${domains.length}</strong> 个</span>
-        <span>点击后在 iframe 中代理访问</span>
+      <div style="font-size:0.85rem; color:var(--text-secondary); margin-top:1rem;">
+        共 <strong>${domains.length}</strong> 个域名
       </div>
     </div>
   </div>
@@ -1128,16 +1127,19 @@ function buildAppHtml(domains, friendLinks) {
   }
   window.filterDomains = filterDomains;
 
-  // 泛域名点击函数（全局）
-  function handleWildcardClick(element) {
-    var base = element.getAttribute('data-base');
-    if (base) {
-      var random = Math.random().toString(36).substring(2, 10);
-      var subdomain = random + '.' + base;
-      window.location.href = '/view/' + encodeURIComponent(subdomain) + '/';
+  // 泛域名点击事件委托
+  document.addEventListener('click', function(e) {
+    var target = e.target.closest('.wildcard-domain');
+    if (target) {
+      var base = target.getAttribute('data-base');
+      if (base) {
+        var random = Math.random().toString(36).substring(2, 10);
+        var subdomain = random + '.' + base;
+        window.location.href = '/view/' + encodeURIComponent(subdomain) + '/';
+      }
+      e.preventDefault();
     }
-  }
-  window.handleWildcardClick = handleWildcardClick;
+  });
 
   // 提交域名
   document.getElementById('submitBtn').addEventListener('click', async function() {
