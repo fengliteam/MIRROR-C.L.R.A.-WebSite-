@@ -1,5 +1,5 @@
 // ============================================================
-// CLRA Mirror - iframe 内嵌代理浏览器版（修复大小写匹配 + 泛域名点击）
+// CLRA Mirror - iframe 内嵌代理浏览器版（泛域名点击修复）
 // ============================================================
 
 const CONFIG = {
@@ -53,16 +53,11 @@ function isRateLimited(ip) {
 function isDomainAllowed(domain, allowedList) {
   if (!Array.isArray(allowedList) || allowedList.length === 0) return false;
   const lowerDomain = domain.toLowerCase();
-  // 将允许列表转为小写并比较
   const lowerAllowed = allowedList.map(d => d.toLowerCase());
   
-  // 精确匹配
   if (lowerAllowed.includes(lowerDomain)) return true;
-  
-  // 泛域名匹配（*.example.com）
   if (lowerAllowed.some(p => p.startsWith('*.') && (lowerDomain === p.slice(2) || lowerDomain.endsWith('.' + p.slice(2))))) return true;
   
-  // www 自动继承
   if (lowerDomain.startsWith('www.')) {
     const base = lowerDomain.slice(4);
     if (lowerAllowed.includes(base)) return true;
@@ -123,13 +118,12 @@ function rewriteUrl(originalUrl, domain) {
   return proxyPath;
 }
 
-// ---------- 获取域名列表（统一转为小写存储） ----------
+// ---------- 获取域名列表（统一转为小写） ----------
 async function getDomainList(env) {
   const now = Date.now();
   if (domainCache && (now - cacheTimestamp) < CONFIG.DOMAIN_CACHE_TTL * 1000) return domainCache;
 
   const domainSet = new Set();
-  // 硬编码域名转为小写
   CONFIG.HARDCODED_DOMAINS.forEach(d => domainSet.add(d.toLowerCase()));
 
   const fetchTasks = CONFIG.LIST_URLS.map(async (url) => {
@@ -173,7 +167,7 @@ async function getDomainList(env) {
   return domainCache;
 }
 
-// ---------- 代理处理（不变） ----------
+// ---------- 代理处理 ----------
 async function handleProxy(request, env) {
   const url = new URL(request.url);
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -201,7 +195,6 @@ async function handleProxy(request, env) {
   }
 
   const allowedDomains = await getDomainList(env);
-  // 传入的 domain 转为小写匹配（isDomainAllowed 内部会处理大小写）
   if (!isDomainAllowed(domain, allowedDomains)) {
     const originalUrl = `https://${domain}${targetPath}${targetSearch}`;
     const html = `
@@ -563,7 +556,7 @@ function buildViewPage(domain, path, search, hash) {
 </html>`;
 }
 
-// ---------- API 处理（不变） ----------
+// ---------- API 处理 ----------
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const method = request.method;
@@ -699,12 +692,12 @@ async function handleApi(request, env) {
 
 // ---------- 构建管理界面 HTML ----------
 function buildAppHtml(domains, friendLinks) {
-  // 域名列表渲染（泛域名添加 data-base）
+  // 泛域名标签添加 onclick 直接调用函数
   const domainItems = domains.map(d => {
     const isWildcard = d.startsWith('*.');
     if (isWildcard) {
       const base = d.slice(2);
-      return `<span class="domain-link wildcard-domain" data-base="${escapeHtml(base)}" data-original="${escapeHtml(d)}" title="点击随机子域名">${escapeHtml(d)} <span class="badge">随机</span></span>`;
+      return `<span class="domain-link wildcard-domain" data-base="${escapeHtml(base)}" onclick="handleWildcardClick(this)" style="cursor:pointer;">${escapeHtml(d)} <span class="badge">随机</span></span>`;
     } else {
       return `<a href="/view/${encodeURIComponent(d)}/" class="domain-link" target="_blank">${escapeHtml(d)}</a>`;
     }
@@ -1135,20 +1128,16 @@ function buildAppHtml(domains, friendLinks) {
   }
   window.filterDomains = filterDomains;
 
-  // 泛域名点击：生成随机子域名并跳转到 /view/ 新域名
-  document.addEventListener('click', function(e) {
-    var target = e.target.closest('.wildcard-domain');
-    if (target) {
-      var base = target.dataset.base;
-      if (base) {
-        var random = Math.random().toString(36).substring(2, 10);
-        var subdomain = random + '.' + base;
-        // 使用 window.location.href 直接跳转，避免弹窗拦截
-        window.location.href = '/view/' + encodeURIComponent(subdomain) + '/';
-      }
-      e.preventDefault();
+  // 泛域名点击函数（全局）
+  function handleWildcardClick(element) {
+    var base = element.getAttribute('data-base');
+    if (base) {
+      var random = Math.random().toString(36).substring(2, 10);
+      var subdomain = random + '.' + base;
+      window.location.href = '/view/' + encodeURIComponent(subdomain) + '/';
     }
-  });
+  }
+  window.handleWildcardClick = handleWildcardClick;
 
   // 提交域名
   document.getElementById('submitBtn').addEventListener('click', async function() {
@@ -1181,7 +1170,7 @@ function buildAppHtml(domains, friendLinks) {
     setTimeout(function() { el.style.display = 'none'; }, 5000);
   }
 
-  // 管理员（不变）
+  // 管理员
   var currentAdminKey = '';
   document.getElementById('adminLoginBtn').addEventListener('click', async function() {
     var keyInput = document.getElementById('adminKeyInput');
