@@ -1,5 +1,5 @@
 // ============================================================
-// CLRA Mirror - 修复版（安全加固 + 导航修复 + 泛域名随机）
+// CLRA Mirror - 最终修复版（导航修复 + 外部资源直连 + 安全加固）
 // ============================================================
 
 const CONFIG = {
@@ -11,7 +11,7 @@ const CONFIG = {
   RATE_LIMIT_PER_MIN: 100,
   DOMAIN_CACHE_TTL: 60,
   MAX_URL_LENGTH: 15000,
-  DEBUG: true,  // 生产环境设为 false 关闭日志
+  DEBUG: false,
 };
 
 let domainCache = null;
@@ -32,10 +32,6 @@ function escapeHtml(text) {
   return text.replace(/[&<>"']/g, m => map[m]);
 }
 
-function log(...args) {
-  if (CONFIG.DEBUG) console.log(...args);
-}
-
 function isRateLimited(ip) {
   const now = Date.now();
   const windowMs = 60 * 1000;
@@ -54,15 +50,15 @@ function isRateLimited(ip) {
   return false;
 }
 
-// ---------- 白名单匹配（大小写不敏感，支持 www 继承） ----------
+// ---------- 白名单匹配 ----------
 function isDomainAllowed(domain, allowedList) {
   if (!Array.isArray(allowedList) || allowedList.length === 0) return false;
   const lowerDomain = domain.toLowerCase();
   const lowerAllowed = allowedList.map(d => d.toLowerCase());
-  
+
   if (lowerAllowed.includes(lowerDomain)) return true;
   if (lowerAllowed.some(p => p.startsWith('*.') && (lowerDomain === p.slice(2) || lowerDomain.endsWith('.' + p.slice(2))))) return true;
-  
+
   if (lowerDomain.startsWith('www.')) {
     const base = lowerDomain.slice(4);
     if (lowerAllowed.includes(base)) return true;
@@ -71,16 +67,29 @@ function isDomainAllowed(domain, allowedList) {
   return false;
 }
 
-// ---------- 强制全代理 ----------
+// ---------- URL 重写（外部资源直连） ----------
 function rewriteUrl(originalUrl, domain) {
   if (!originalUrl || typeof originalUrl !== 'string') return originalUrl;
+  // 特殊协议直接返回
   if (/^(data|blob|javascript|mailto|tel|ws|wss):/i.test(originalUrl)) return originalUrl;
   if (originalUrl.startsWith('/proxy/')) return originalUrl;
+
+  // 对于 cloudflareinsights.com 等外部资源，直接返回原始 URL，不代理
+  const externalDomains = ['static.cloudflareinsights.com', 'performance.radar.cloudflare.com'];
+  try {
+    const urlObj = new URL(originalUrl);
+    if (externalDomains.includes(urlObj.hostname)) {
+      return originalUrl;
+    }
+  } catch (_) {}
 
   let urlString = originalUrl;
   if (urlString.startsWith('//')) urlString = 'https:' + urlString;
 
-  let targetDomain = '', path = '', search = '', hash = '';
+  let targetDomain = '',
+    path = '',
+    search = '',
+    hash = '';
   try {
     let urlObj;
     if (urlString.startsWith('http://') || urlString.startsWith('https://')) {
@@ -122,7 +131,7 @@ function rewriteUrl(originalUrl, domain) {
   return proxyPath;
 }
 
-// ---------- 获取域名列表（统一小写） ----------
+// ---------- 获取域名列表 ----------
 async function getDomainList(env) {
   const now = Date.now();
   if (domainCache && (now - cacheTimestamp) < CONFIG.DOMAIN_CACHE_TTL * 1000) return domainCache;
@@ -171,7 +180,7 @@ async function getDomainList(env) {
   return domainCache;
 }
 
-// ---------- 代理处理（添加 CORS 头） ----------
+// ---------- 代理处理 ----------
 async function handleProxy(request, env) {
   const url = new URL(request.url);
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -261,8 +270,6 @@ async function handleProxy(request, env) {
     const respHeaders = new Headers(response.headers);
     respHeaders.delete('content-security-policy');
     respHeaders.delete('content-security-policy-report-only');
-    // 添加 CORS 头缓解跨域问题（可选）
-    respHeaders.set('Access-Control-Allow-Origin', '*');
 
     if (contentType.includes('text/html')) {
       const interceptorScript = `
@@ -272,6 +279,12 @@ async function handleProxy(request, env) {
           var proxyBase = '/proxy/';
           function getProxyUrl(url) {
             if (!url || url.startsWith(proxyBase) || /^(data|blob|javascript|mailto|tel|ws|wss):/i.test(url)) return url;
+            // 外部资源直连
+            var externalDomains = ['static.cloudflareinsights.com', 'performance.radar.cloudflare.com'];
+            try {
+              var urlObj = new URL(url);
+              if (externalDomains.includes(urlObj.hostname)) return url;
+            } catch(e) {}
             var fullUrl;
             try {
               fullUrl = new URL(url, window.location.origin);
@@ -395,7 +408,7 @@ async function handleProxy(request, env) {
 
     return new Response(response.body, { status: response.status, headers: respHeaders });
   } catch (error) {
-    log('[代理错误]', error.message);
+    console.error('[代理错误]', error.message);
     return new Response(`代理服务异常：${error.message}`, { status: 502 });
   }
 }
@@ -562,43 +575,16 @@ function buildViewPage(domain, path, search, hash) {
 </html>`;
 }
 
-// ---------- API 处理（增加 Origin/Referer 校验） ----------
+// ---------- API 处理 ----------
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const method = request.method;
   const path = url.pathname;
 
-  // CSRF 防护：校验 Origin 或 Referer 是否为当前域
-  const origin = request.headers.get('Origin');
-  const referer = request.headers.get('Referer');
-  const allowedDomain = env.APP_DOMAIN || 'clra.xingying.us.kg';
-  let isValid = false;
-  if (origin) {
-    try {
-      const originUrl = new URL(origin);
-      if (originUrl.hostname === allowedDomain || originUrl.hostname.endsWith('.' + allowedDomain)) isValid = true;
-    } catch (_) {}
-  }
-  if (!isValid && referer) {
-    try {
-      const refererUrl = new URL(referer);
-      if (refererUrl.hostname === allowedDomain || refererUrl.hostname.endsWith('.' + allowedDomain)) isValid = true;
-    } catch (_) {}
-  }
-  // 对于 GET 请求（健康检查、获取数据）可以放宽，但修改操作必须验证
-  const isModify = ['POST', 'PUT', 'DELETE'].includes(method);
-  if (isModify && !isValid && request.headers.get('X-Admin-Key') !== env.ADMIN_API_KEY) {
-    // 如果是管理员密钥验证通过，也放行（因为密钥本应保密）
-    // 但为了安全，我们仍要求来源同域或使用密钥
-    // 此处简单处理：如果提供了密钥且匹配，无论来源都允许（但密钥应保密）
-  }
-
-  // 健康检查
   if (method === 'GET' && path === '/api/health') {
     return jsonResponse({ status: 'ok', timestamp: Date.now() });
   }
 
-  // 提交域名
   if (method === 'POST' && path === '/api/domains') {
     try {
       const { domain } = await request.json();
@@ -624,7 +610,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 管理员：获取待审列表
   if (method === 'GET' && path === '/api/admin/pending') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
@@ -636,7 +621,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 管理员：获取已审核列表
   if (method === 'GET' && path === '/api/admin/approved') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
@@ -648,7 +632,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 管理员：审核单个
   if (method === 'POST' && path === '/api/admin/approve') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
@@ -677,7 +660,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 管理员：删除单个已审核
   if (method === 'DELETE' && path === '/api/admin/approved') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
@@ -697,7 +679,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 管理员：批量删除
   if (method === 'DELETE' && path === '/api/admin/approved/batch') {
     const adminKey = request.headers.get('X-Admin-Key');
     if (adminKey !== env.ADMIN_API_KEY) return new Response('未授权', { status: 401 });
@@ -716,7 +697,6 @@ async function handleApi(request, env) {
     }
   }
 
-  // 获取友链
   if (method === 'GET' && path === '/api/friends') {
     try {
       const friends = env.FRIEND_LINKS ? JSON.parse(env.FRIEND_LINKS) : [];
@@ -731,7 +711,6 @@ async function handleApi(request, env) {
 
 // ---------- 构建管理界面 HTML ----------
 function buildAppHtml(domains, friendLinks) {
-  // 生成域名标签（泛域名用 data-base）
   const domainItems = domains.map(d => {
     const isWildcard = d.startsWith('*.');
     if (isWildcard) {
@@ -742,7 +721,6 @@ function buildAppHtml(domains, friendLinks) {
     }
   }).join('');
 
-  // 生成友链
   const friendItems = (friendLinks || []).map(f => {
     const name = escapeHtml(f.name || f.url);
     const url = f.url;
@@ -1174,7 +1152,7 @@ function buildAppHtml(domains, friendLinks) {
   }
   window.filterDomains = filterDomains;
 
-  // ---------- 泛域名点击事件委托 ----------
+  // ---------- 泛域名点击 ----------
   document.addEventListener('click', function(e) {
     var target = e.target.closest('.wildcard-domain');
     if (target) {
@@ -1249,9 +1227,8 @@ function buildAppHtml(domains, friendLinks) {
       } else {
         html += '<table><thead><tr><th>域名</th><th>提交者IP</th><th>时间</th><th>操作</th></tr></thead><tbody>';
         pending.forEach(function(item) {
-          // 转义域名防止 XSS
           var safeDomain = escapeHtml(item.domain);
-          html += '<tr><td>' + safeDomain + '</td><td>' + escapeHtml(item.submitter) + '</td><td>' + new Date(item.time).toLocaleString() + '</td><td><button class="btn btn-success btn-sm" data-domain="' + escapeHtml(item.domain) + '" data-action="approve">通过</button><button class="btn btn-danger btn-sm" data-domain="' + escapeHtml(item.domain) + '" data-action="reject">拒绝</button></td></tr>';
+          html += '<tr><td>' + safeDomain + '</td><td>' + escapeHtml(item.submitter) + '</td><td>' + new Date(item.time).toLocaleString() + '</td><td><button class="btn btn-success btn-sm" data-domain="' + safeDomain + '" data-action="approve">通过</button><button class="btn btn-danger btn-sm" data-domain="' + safeDomain + '" data-action="reject">拒绝</button></td></tr>';
         });
         html += '</tbody></table>';
       }
@@ -1448,7 +1425,7 @@ export default {
 
       return new Response('未找到资源', { status: 404 });
     } catch (err) {
-      log('[全局异常]', err.stack);
+      console.error('[全局异常]', err.stack);
       return new Response('服务器内部错误', { status: 500 });
     }
   },
