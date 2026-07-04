@@ -1,5 +1,5 @@
 // ============================================================
-// CLRA Mirror - iframe 内嵌代理浏览器版（语法修正）
+// CLRA Mirror - iframe 内嵌代理浏览器版（修复大小写匹配 + 泛域名点击）
 // ============================================================
 
 const CONFIG = {
@@ -49,16 +49,26 @@ function isRateLimited(ip) {
   return false;
 }
 
-// ---------- 增强白名单匹配 ----------
+// ---------- 白名单匹配（大小写不敏感，支持 www 自动继承） ----------
 function isDomainAllowed(domain, allowedList) {
   if (!Array.isArray(allowedList) || allowedList.length === 0) return false;
-  if (allowedList.includes(domain)) return true;
-  if (allowedList.some(p => p.startsWith('*.') && (domain === p.slice(2) || domain.endsWith('.' + p.slice(2))))) return true;
-  if (domain.startsWith('www.')) {
-    const base = domain.slice(4);
-    if (allowedList.includes(base)) return true;
-    if (allowedList.some(p => p.startsWith('*.') && (base === p.slice(2) || base.endsWith('.' + p.slice(2))))) return true;
+  const lowerDomain = domain.toLowerCase();
+  // 将允许列表转为小写并比较
+  const lowerAllowed = allowedList.map(d => d.toLowerCase());
+  
+  // 精确匹配
+  if (lowerAllowed.includes(lowerDomain)) return true;
+  
+  // 泛域名匹配（*.example.com）
+  if (lowerAllowed.some(p => p.startsWith('*.') && (lowerDomain === p.slice(2) || lowerDomain.endsWith('.' + p.slice(2))))) return true;
+  
+  // www 自动继承
+  if (lowerDomain.startsWith('www.')) {
+    const base = lowerDomain.slice(4);
+    if (lowerAllowed.includes(base)) return true;
+    if (lowerAllowed.some(p => p.startsWith('*.') && (base === p.slice(2) || base.endsWith('.' + p.slice(2))))) return true;
   }
+  
   return false;
 }
 
@@ -113,20 +123,21 @@ function rewriteUrl(originalUrl, domain) {
   return proxyPath;
 }
 
-// ---------- 获取域名列表 ----------
+// ---------- 获取域名列表（统一转为小写存储） ----------
 async function getDomainList(env) {
   const now = Date.now();
   if (domainCache && (now - cacheTimestamp) < CONFIG.DOMAIN_CACHE_TTL * 1000) return domainCache;
 
   const domainSet = new Set();
-  CONFIG.HARDCODED_DOMAINS.forEach(d => domainSet.add(d));
+  // 硬编码域名转为小写
+  CONFIG.HARDCODED_DOMAINS.forEach(d => domainSet.add(d.toLowerCase()));
 
   const fetchTasks = CONFIG.LIST_URLS.map(async (url) => {
     try {
       const resp = await fetch(url, { headers: { 'User-Agent': 'CLRA-Mirror' } });
       if (!resp.ok) return [];
       const text = await resp.text();
-      return text.split(/[\s\n]+/).filter(s => s && s.length > 0);
+      return text.split(/[\s\n]+/).filter(s => s && s.length > 0).map(s => s.toLowerCase());
     } catch { return []; }
   });
   const results = await Promise.allSettled(fetchTasks);
@@ -139,7 +150,7 @@ async function getDomainList(env) {
   if (env && env.DOMAINS_KV) {
     try {
       const approved = await env.DOMAINS_KV.get('approved_list', 'json');
-      if (Array.isArray(approved)) approved.forEach(d => domainSet.add(d));
+      if (Array.isArray(approved)) approved.forEach(d => domainSet.add(d.toLowerCase()));
     } catch (_) {}
   }
 
@@ -150,7 +161,7 @@ async function getDomainList(env) {
         friends.forEach(f => {
           if (f.url) {
             let domain = f.url.replace(/^https?:\/\//, '').split('/')[0];
-            if (domain) domainSet.add(domain);
+            if (domain) domainSet.add(domain.toLowerCase());
           }
         });
       }
@@ -162,7 +173,7 @@ async function getDomainList(env) {
   return domainCache;
 }
 
-// ---------- 代理处理 ----------
+// ---------- 代理处理（不变） ----------
 async function handleProxy(request, env) {
   const url = new URL(request.url);
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -190,6 +201,7 @@ async function handleProxy(request, env) {
   }
 
   const allowedDomains = await getDomainList(env);
+  // 传入的 domain 转为小写匹配（isDomainAllowed 内部会处理大小写）
   if (!isDomainAllowed(domain, allowedDomains)) {
     const originalUrl = `https://${domain}${targetPath}${targetSearch}`;
     const html = `
@@ -551,7 +563,7 @@ function buildViewPage(domain, path, search, hash) {
 </html>`;
 }
 
-// ---------- API 处理 ----------
+// ---------- API 处理（不变） ----------
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const method = request.method;
@@ -687,6 +699,7 @@ async function handleApi(request, env) {
 
 // ---------- 构建管理界面 HTML ----------
 function buildAppHtml(domains, friendLinks) {
+  // 域名列表渲染（泛域名添加 data-base）
   const domainItems = domains.map(d => {
     const isWildcard = d.startsWith('*.');
     if (isWildcard) {
@@ -1122,7 +1135,7 @@ function buildAppHtml(domains, friendLinks) {
   }
   window.filterDomains = filterDomains;
 
-  // 泛域名随机
+  // 泛域名点击：生成随机子域名并跳转到 /view/ 新域名
   document.addEventListener('click', function(e) {
     var target = e.target.closest('.wildcard-domain');
     if (target) {
@@ -1130,7 +1143,8 @@ function buildAppHtml(domains, friendLinks) {
       if (base) {
         var random = Math.random().toString(36).substring(2, 10);
         var subdomain = random + '.' + base;
-        window.open('/view/' + encodeURIComponent(subdomain) + '/', '_blank');
+        // 使用 window.location.href 直接跳转，避免弹窗拦截
+        window.location.href = '/view/' + encodeURIComponent(subdomain) + '/';
       }
       e.preventDefault();
     }
@@ -1167,7 +1181,7 @@ function buildAppHtml(domains, friendLinks) {
     setTimeout(function() { el.style.display = 'none'; }, 5000);
   }
 
-  // 管理员
+  // 管理员（不变）
   var currentAdminKey = '';
   document.getElementById('adminLoginBtn').addEventListener('click', async function() {
     var keyInput = document.getElementById('adminKeyInput');
